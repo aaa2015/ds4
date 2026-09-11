@@ -64282,11 +64282,13 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 
 bool ds4_engine_can_rewind(ds4_engine *e) {
     if (!e) return false;
-    /* GLM engines keep a rollback frontier.  Metal DSpark snapshots are not
-     * reusable from ds4_session_rewind() yet, so admitting them here would
-     * drop the checkpoint and force the very rebuild this helper exists to
-     * avoid; enable them once that path can restore its state. */
-    return ds4_engine_is_glm_dsa(e) || ds4_engine_is_glm53(e);
+    if (ds4_engine_is_glm_dsa(e) || ds4_engine_is_glm53(e)) return true;
+#ifndef DS4_NO_GPU
+    /* Metal DSpark restores snapshots from ds4_session_rewind(), so DeepSeek
+     * rewind requests can take the fast path. */
+    if (e->backend == DS4_BACKEND_METAL && e->dspark) return true;
+#endif
+    return false;
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
