@@ -9062,6 +9062,7 @@ static double now_sec(void) {
 }
 
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static __thread int current_thread_slot_id = -1;
 
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
@@ -9084,7 +9085,16 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     } else {
         char *line = xmalloc((size_t)n + 1);
         vsnprintf(line, (size_t)n + 1, fmt, ap);
-        ds4_log(stderr, type, "%s", line);
+        if (current_thread_slot_id >= 0 && !strncmp(line, "ds4-server: ", 12)) {
+            const char *rest = line + 12;
+            if (strncmp(rest, "[slot ", 6) != 0) {
+                ds4_log(stderr, type, "ds4-server: [slot %d] %s", current_thread_slot_id, rest);
+            } else {
+                ds4_log(stderr, type, "%s", line);
+            }
+        } else {
+            ds4_log(stderr, type, "%s", line);
+        }
         free(line);
     }
     va_end(ap);
@@ -12506,51 +12516,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (cached == 0 && old_pos > 0) {
-        char mismatch_info[512] = "";
+        char mismatch_info[128] = "";
         if (common < old_pos && prompt_for_sync && common < prompt_for_sync->len) {
             const ds4_tokens *live_toks = ds4_session_tokens(slot->session);
             if (live_toks && common < live_toks->len) {
                 int old_t = live_toks->v[common];
                 int new_t = prompt_for_sync->v[common];
-                size_t old_tl = 0, new_tl = 0;
-                char *old_txt = ds4_token_text(s->engine, old_t, &old_tl);
-                char *new_txt = ds4_token_text(s->engine, new_t, &new_tl);
-                char old_ctx[96] = "", new_ctx[96] = "";
-                size_t old_len = 0, new_len = 0;
-                int start = common > 5 ? common - 5 : 0;
-                for (int ci = start; ci < common + 6; ci++) {
-                    if (ci < live_toks->len) {
-                        size_t l = 0;
-                        char *t = ds4_token_text(s->engine, live_toks->v[ci], &l);
-                        if (t) {
-                            if (old_len + l < sizeof(old_ctx) - 1) {
-                                memcpy(old_ctx + old_len, t, l);
-                                old_len += l;
-                                old_ctx[old_len] = '\0';
-                            }
-                            free(t);
-                        }
-                    }
-                    if (ci < prompt_for_sync->len) {
-                        size_t l = 0;
-                        char *t = ds4_token_text(s->engine, prompt_for_sync->v[ci], &l);
-                        if (t) {
-                            if (new_len + l < sizeof(new_ctx) - 1) {
-                                memcpy(new_ctx + new_len, t, l);
-                                new_len += l;
-                                new_ctx[new_len] = '\0';
-                            }
-                            free(t);
-                        }
-                    }
-                }
                 snprintf(mismatch_info, sizeof(mismatch_info),
-                         " mismatch@%d live_tok=%d(\"%.*s\") req_tok=%d(\"%.*s\") live_ctx=\"%.40s\" req_ctx=\"%.40s\"",
-                         common, old_t, (int)old_tl, old_txt ? old_txt : "",
-                         new_t, (int)new_tl, new_txt ? new_txt : "",
-                         old_ctx, new_ctx);
-                free(old_txt);
-                free(new_txt);
+                         " mismatch@%d live_tok=%d req_tok=%d",
+                         common, old_t, new_t);
             }
         }
         server_log(DS4_LOG_WARNING,
@@ -13473,33 +13447,15 @@ decode_again:
                          recovery_err[0] ? recovery_err : "unknown error");
             }
             if (!parsed_ok) {
-                /* Print raw DSML snippet for debugging */
-                size_t dsml_snippet_len = 0;
-                const char *dsml_start = find_any_tool_start(text.ptr ? text.ptr : "");
-                if (dsml_start) {
-                    dsml_snippet_len = text.len - (dsml_start - text.ptr);
-                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
-                }
-                /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
                 server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
+                           "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d]",
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags,
                            final_finish,
                            text.len,
                            saw_tool_start,
-                           saw_tool_end,
-                           (int)text_snippet_len,
-                           text.ptr ? text.ptr : "(null)");
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
-                           (int)dsml_snippet_len,
-                           dsml_start ? dsml_start : "(none)");
+                           saw_tool_end);
                 trace_event(s, trace_id,
                             "invalid tool call returned as assistant text finish=%s",
                             final_finish);
@@ -13693,15 +13649,14 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: [slot %d] chat ctx=%s gen=%d%s%s finish=%s %.3fs text=\"%.80s\"",
+                       "ds4-server: [slot %d] chat ctx=%s gen=%d%s%s finish=%s %.3fs",
                        slot->id,
                        ctx_span,
                        completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
-                       now_sec() - t0,
-                       text.ptr ? text.ptr : "");
+                       now_sec() - t0);
         }
     } else {
         char flags[80];
@@ -13748,6 +13703,7 @@ decode_again:
  * return in the large protocol/generation path. The callback is cleared before
  * the client thread can destroy its stack-owned job. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    current_thread_slot_id = slot ? slot->id : -1;
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
@@ -13760,6 +13716,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (slot->running == j) slot->running = NULL;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
+    current_thread_slot_id = -1;
 }
 
 static bool live_state_contains_all(const live_tool_state *state,
