@@ -10353,11 +10353,19 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
 
-static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
-                                    const ds4_tokens *prompt,
-                                    int user_token_id,
-                                    int assistant_token_id) {
+static DS4_SERVER_MAYBE_UNUSED int kv_cache_chat_anchor_pos(
+        const kv_disk_cache *kc,
+        const ds4_tokens *prompt,
+        int user_token_id,
+        int assistant_token_id) {
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+}
+
+static int kv_cache_chat_latest_anchor_pos(const kv_disk_cache *kc,
+                                           const ds4_tokens *prompt,
+                                           int user_token_id,
+                                           int assistant_token_id) {
+    return ds4_kvstore_chat_latest_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
 
@@ -12585,17 +12593,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    if (!multimodal &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
+        const int anchor =
+            kv_cache_chat_latest_anchor_pos(&s->kv, prompt_for_sync,
+                                            ds4_token_user(s->engine),
+                                            ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (cold_store_len <= cached) cold_store_len = 0;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -19322,6 +19332,49 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_chat_latest_anchor_multiturn(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, 1);
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* first task at pos 2 */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, assistant); /* first assistant at pos 4 */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, user);      /* later user turn at pos 6 */
+    ds4_tokens_push(&prompt, 5);
+    ds4_tokens_push(&prompt, assistant); /* pending generation at pos 8 */
+
+    /* The legacy cold anchor stops at the first assistant (pos 2).
+     * The multi-turn latest anchor finds the user marker before the final assistant (pos 6). */
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &prompt, user, assistant) == 6);
+
+    /* Single-turn prompt: latest anchor matches legacy cold anchor. */
+    ds4_tokens single = {0};
+    ds4_tokens_push(&single, 1);
+    ds4_tokens_push(&single, 2);
+    ds4_tokens_push(&single, user);      /* pos 2 */
+    ds4_tokens_push(&single, 3);
+    ds4_tokens_push(&single, assistant); /* pos 4 */
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &single, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &single, user, assistant) == 2);
+
+    /* min_tokens threshold */
+    kc.opt.min_tokens = 7;
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &prompt, user, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &prompt, -1, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &prompt, user, -1) == -1);
+
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&single);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -20616,6 +20669,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_chat_latest_anchor_multiturn();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

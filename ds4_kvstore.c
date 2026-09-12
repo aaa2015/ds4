@@ -727,6 +727,34 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
+int ds4_kvstore_chat_latest_anchor_pos(const ds4_kvstore *kc,
+                                       const ds4_tokens *prompt,
+                                       int user_token_id,
+                                       int assistant_token_id) {
+    if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
+
+    /* For ongoing / multi-turn sessions, the permanent conversation history
+     * extends up to the latest user message. Find the last assistant marker
+     * (the pending turn prefix) and the last user marker before it. */
+    int last_assistant = -1;
+    for (int i = prompt->len - 1; i >= 0; i--) {
+        if (prompt->v[i] == assistant_token_id) {
+            last_assistant = i;
+            break;
+        }
+    }
+    if (last_assistant < 0) return -1;
+
+    int last_user = -1;
+    for (int i = last_assistant - 1; i >= 0; i--) {
+        if (prompt->v[i] == user_token_id) {
+            last_user = i;
+            break;
+        }
+    }
+    return last_user >= kc->opt.min_tokens ? last_user : -1;
+}
+
 static int kv_cache_continued_step(const ds4_kvstore *kc) {
     if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
     int step = kc->opt.continued_interval_tokens;
