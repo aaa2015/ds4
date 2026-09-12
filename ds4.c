@@ -75533,6 +75533,27 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #endif
 }
 
+bool ds4_session_can_rewind(ds4_session *s, int pos) {
+    if (!s || !s->checkpoint_valid) return false;
+    if (pos < 0 || pos >= s->checkpoint.len) return false;
+    if (ds4_session_tp_leader(s) && ds4_tp_failed(s->engine->tp.ctx)) return false;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_glm(s)) {
+        if (!s->glm_graph.glm53) return true;
+        return s->glm_mtp_rollback_valid &&
+               s->checkpoint.len == (int)s->glm_mtp_rollback_pos + 2 &&
+               (pos == (int)s->glm_mtp_rollback_pos ||
+                pos == (int)s->glm_mtp_rollback_pos + 1);
+    }
+    if (s->engine && s->engine->backend == DS4_BACKEND_METAL) {
+        return !s->engine->tp.active &&
+               s->dspark_rollback_end == s->checkpoint.len &&
+               pos > s->dspark_rollback_start;
+    }
+#endif
+    return false;
+}
+
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }

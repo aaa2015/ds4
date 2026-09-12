@@ -12408,31 +12408,39 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             j->req.prompt.len, common, &full_prefix);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, rewind_to);
-            const bool rewind_valid =
-                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                    rewind_to &&
-                (!multimodal ||
-                 ds4_session_vision_prefix_matches(slot->session,
-                                                  j->req.images,
-                                                  j->req.image_count));
-            pthread_mutex_unlock(&s->inference_mu);
-            if (rewind_valid) {
-                cached = rewind_to;
-                cache_source = "memory-rewind";
-                cache_diag.rewind_to = rewind_to;
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound live prefix from %d to %d; %s",
-                           old_pos, rewind_to,
-                           full_prefix ?
-                               "final prompt token will be reevaluated" :
-                               "suffix tokens will be evaluated");
+            if (ds4_session_can_rewind(slot->session, rewind_to)) {
+                ds4_session_rewind(slot->session, rewind_to);
+                const bool rewind_valid =
+                    ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                        rewind_to &&
+                    (!multimodal ||
+                     ds4_session_vision_prefix_matches(slot->session,
+                                                      j->req.images,
+                                                      j->req.image_count));
+                pthread_mutex_unlock(&s->inference_mu);
+                if (rewind_valid) {
+                    cached = rewind_to;
+                    cache_source = "memory-rewind";
+                    cache_diag.rewind_to = rewind_to;
+                    server_log(DS4_LOG_KVCACHE,
+                               "ds4-server: rewound live prefix from %d to %d; %s",
+                               old_pos, rewind_to,
+                               full_prefix ?
+                                   "final prompt token will be reevaluated" :
+                                   "suffix tokens will be evaluated");
+                } else {
+                    server_log(DS4_LOG_KVCACHE,
+                               "ds4-server: live prefix rewind from %d to %d requires rebuild",
+                               old_pos, rewind_to);
+                }
             } else {
+                pthread_mutex_unlock(&s->inference_mu);
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: live prefix rewind from %d to %d requires rebuild",
-                           old_pos, rewind_to);
+                           "ds4-server: live prefix rewind to %d skipped: session has no frontier snapshot covering target (live=%d common=%d)",
+                           rewind_to, old_pos, common);
             }
-        } else {
+        }
+        if (cached == 0) {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
         }

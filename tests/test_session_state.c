@@ -325,6 +325,7 @@ static void test_dspark_rollback_misses(void) {
             assert(s->dspark_rollback_end == 0);
             s->graph.dspark_cache_len = 0;
         }
+        if (mode <= 4) assert(!ds4_session_can_rewind(s, pos));
         /* mode 5 enters restore and fails: history must still be truncated. */
         ds4_session_rewind(s, pos);
         assert(s->checkpoint.len == pos && !s->checkpoint_valid);
@@ -332,6 +333,43 @@ static void test_dspark_rollback_misses(void) {
         assert(!s->dspark_draft_len && ds4_session_argmax(s) == -1);
         for (int i = 0; i < pos; i++) assert(s->checkpoint.v[i] == i);
     }
+    ds4_session_free(s);
+}
+
+static void test_session_can_rewind(void) {
+    ds4_engine e = {.backend = DS4_BACKEND_METAL};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    for (int i = 0; i < 132; i++) ds4_tokens_push(&s->checkpoint, i);
+    s->checkpoint.len = 132;
+    s->checkpoint_valid = true;
+    s->dspark_rollback_start = 127;
+    s->dspark_rollback_end = 132;
+
+    /* Pos within the rollback block is eligible. */
+    assert(ds4_session_can_rewind(s, 128));
+    assert(ds4_session_can_rewind(s, 129));
+    assert(ds4_session_can_rewind(s, 131));
+
+    /* Frontier boundary (start), before frontier, or out-of-range are rejected. */
+    assert(!ds4_session_can_rewind(s, 127));
+    assert(!ds4_session_can_rewind(s, 126));
+    assert(!ds4_session_can_rewind(s, 0));
+    assert(!ds4_session_can_rewind(s, 132));
+    assert(!ds4_session_can_rewind(s, -1));
+
+    /* Invalidation prevents rewind. */
+    s->checkpoint_valid = false;
+    assert(!ds4_session_can_rewind(s, 129));
+    s->checkpoint_valid = true;
+
+    ds4_session_dspark_capture_invalidate(s);
+    assert(!ds4_session_can_rewind(s, 129));
+
+    /* Null session or checkpoint invalid. */
+    assert(!ds4_session_can_rewind(NULL, 129));
+
     ds4_session_free(s);
 }
 
@@ -455,6 +493,7 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_dspark_rollback_misses();
+    test_session_can_rewind();
     test_glm_attention_budget();
     test_glm_spec_rollback();
 #endif
