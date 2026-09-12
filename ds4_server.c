@@ -10460,6 +10460,14 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
+static bool tokens_have_thinking_control(ds4_engine *e, const ds4_tokens *tokens) {
+    if (!e || !tokens) return false;
+    for (int i = 0; i < tokens->len; i++) {
+        if (ds4_token_is_thinking_control(e, tokens->v[i])) return true;
+    }
+    return false;
+}
+
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
     if (!s || !slot) return;
@@ -10493,12 +10501,19 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * intentionally does not replay.  For disk recovery after a session switch,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
-     * tokenizes only the visible suffix that follows this key. */
+     * tokenizes only the visible suffix that follows this key.
+     *
+     * Without visible text, if the live session contains hidden thinking tokens,
+     * rendering raw tokens produces an unmatchable key because clients strip
+     * thinking tags on replay.  Skip saving unhittable raw thinking tokens. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
                                         visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
+        if (tokens_have_thinking_control(s->engine, tokens)) {
+            return;
+        }
         kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
     }
 }
@@ -12489,12 +12504,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
+    const int old_stored = slot->continued_last_store_tokens;
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+        old_pos >= s->kv.opt.min_tokens &&
+        common < s->kv.opt.min_tokens &&
+        old_stored < old_pos) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+         * current checkpoint only for an unrelated conversation switch.  For
+         * continuations / forks of the current session (common >= min_tokens),
+         * the client has advanced or pruned past the common prefix, so the live
+         * tail is superseded and persisting it produces dead unhittable files. */
         kv_cache_store_current(s, slot, "evict");
     }
     if (!multimodal && cached == 0) {
@@ -19375,6 +19395,18 @@ static void test_kv_cache_chat_latest_anchor_multiturn(void) {
     ds4_tokens_free(&single);
 }
 
+static void test_tokens_have_thinking_control_detection(void) {
+    ds4_tokens tokens = {0};
+    TEST_ASSERT(!tokens_have_thinking_control(NULL, NULL));
+    TEST_ASSERT(!tokens_have_thinking_control(NULL, &tokens));
+
+    ds4_tokens_push(&tokens, 1);
+    ds4_tokens_push(&tokens, 2);
+    TEST_ASSERT(!tokens_have_thinking_control(NULL, &tokens));
+
+    ds4_tokens_free(&tokens);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -20670,6 +20702,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_chat_latest_anchor_multiturn();
+    test_tokens_have_thinking_control_detection();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
