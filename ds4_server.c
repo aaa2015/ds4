@@ -3682,6 +3682,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+            got_thinking = true;
+            if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            else thinking_enabled = true;
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
@@ -3896,11 +3899,17 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            got_thinking = true;
+            if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            else thinking_enabled = true;
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
                 goto bad;
             }
+            got_thinking = true;
+            if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            else thinking_enabled = true;
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -4883,6 +4892,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 /* Responses-API effort of "minimal" / "none" maps to disabled
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+                else thinking_enabled = true;
             }
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))
@@ -5136,6 +5146,9 @@ static bool parse_completion_request(ds4_engine *e, server *s, const char *body,
                 free(key);
                 goto bad;
             }
+            got_thinking = true;
+            if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+            else thinking_enabled = true;
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
@@ -12459,7 +12472,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             } else {
                 pthread_mutex_unlock(&s->inference_mu);
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: live prefix rewind to %d skipped: session has no frontier snapshot covering target (live=%d common=%d)",
+                           "ds4-server: [slot %d] live prefix rewind to %d skipped: session has no frontier snapshot covering target (live=%d common=%d)",
+                           slot->id,
                            rewind_to, old_pos, common);
             }
         }
@@ -12492,12 +12506,61 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (cached == 0 && old_pos > 0) {
+        char mismatch_info[512] = "";
+        if (common < old_pos && prompt_for_sync && common < prompt_for_sync->len) {
+            const ds4_tokens *live_toks = ds4_session_tokens(slot->session);
+            if (live_toks && common < live_toks->len) {
+                int old_t = live_toks->v[common];
+                int new_t = prompt_for_sync->v[common];
+                size_t old_tl = 0, new_tl = 0;
+                char *old_txt = ds4_token_text(s->engine, old_t, &old_tl);
+                char *new_txt = ds4_token_text(s->engine, new_t, &new_tl);
+                char old_ctx[96] = "", new_ctx[96] = "";
+                size_t old_len = 0, new_len = 0;
+                int start = common > 5 ? common - 5 : 0;
+                for (int ci = start; ci < common + 6; ci++) {
+                    if (ci < live_toks->len) {
+                        size_t l = 0;
+                        char *t = ds4_token_text(s->engine, live_toks->v[ci], &l);
+                        if (t) {
+                            if (old_len + l < sizeof(old_ctx) - 1) {
+                                memcpy(old_ctx + old_len, t, l);
+                                old_len += l;
+                                old_ctx[old_len] = '\0';
+                            }
+                            free(t);
+                        }
+                    }
+                    if (ci < prompt_for_sync->len) {
+                        size_t l = 0;
+                        char *t = ds4_token_text(s->engine, prompt_for_sync->v[ci], &l);
+                        if (t) {
+                            if (new_len + l < sizeof(new_ctx) - 1) {
+                                memcpy(new_ctx + new_len, t, l);
+                                new_len += l;
+                                new_ctx[new_len] = '\0';
+                            }
+                            free(t);
+                        }
+                    }
+                }
+                snprintf(mismatch_info, sizeof(mismatch_info),
+                         " mismatch@%d live_tok=%d(\"%.*s\") req_tok=%d(\"%.*s\") live_ctx=\"%.40s\" req_ctx=\"%.40s\"",
+                         common, old_t, (int)old_tl, old_txt ? old_txt : "",
+                         new_t, (int)new_tl, new_txt ? new_txt : "",
+                         old_ctx, new_ctx);
+                free(old_txt);
+                free(new_txt);
+            }
+        }
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
+                   "ds4-server: [slot %d] live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s%s",
+                   slot->id,
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
                    live_vision_match ? "match" : "mismatch",
-                   trace_cache_miss_reason(&cache_diag));
+                   trace_cache_miss_reason(&cache_diag),
+                   mismatch_info);
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -12604,7 +12667,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     cache_source, cached);
     }
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: %s ctx=%s%s%s prompt start",
+               "ds4-server: [slot %d] %s ctx=%s%s%s prompt start",
+               slot->id,
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
                req_flags[0] ? " " : "",
@@ -12619,13 +12683,29 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        const int anchor =
+        int anchor =
             kv_cache_chat_latest_anchor_pos(&s->kv, prompt_for_sync,
                                             ds4_token_user(s->engine),
                                             ds4_token_assistant(s->engine));
+        if (anchor < s->kv.opt.min_tokens) {
+            const int user_tok = ds4_token_user(s->engine);
+            if (user_tok >= 0) {
+                for (int i = prompt_for_sync->len - 1; i >= 0; i--) {
+                    if (prompt_for_sync->v[i] == user_tok) {
+                        if (i >= s->kv.opt.min_tokens) anchor = i;
+                        break;
+                    }
+                }
+            }
+        }
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
         if (cold_store_len <= cached) cold_store_len = 0;
+        if (cold_store_len > 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: [slot %d] cold store anchor=%d len=%d prompt_len=%d cached=%d",
+                       slot->id, anchor, cold_store_len, prompt_for_sync->len, cached);
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13612,13 +13692,15 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: [slot %d] chat ctx=%s gen=%d%s%s finish=%s %.3fs text=\"%.80s\"",
+                       slot->id,
                        ctx_span,
                        completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
-                       now_sec() - t0);
+                       now_sec() - t0,
+                       text.ptr ? text.ptr : "");
         }
     } else {
         char flags[80];
@@ -13738,14 +13820,30 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
             byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
     }
     free(key);
-    if (visible_match) return live_pos;
-    if (ds4_session_pos(slot->session) > 0 &&
+    if (visible_match) return 2000000 + live_pos;
+    if (live_pos > 0 &&
         !ds4_session_vision_prefix_matches(slot->session,
                                           j->req.images, j->req.image_count)) {
-        return -1;
+        return INT_MIN / 2;
+    }
+    if (live_pos == 0) {
+        /* Clean empty slot: can accept any new conversation without evicting cache. */
+        return 0;
     }
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    /* A meaningful continuation must match more than trivial BOS/role tokens (>= 4)
+     * and cover either a substantial fraction of the existing session or a large prefix. */
+    bool is_continuation = (common >= 4) &&
+                           (common >= live_pos / 2 ||
+                            common >= live_pos - 128 ||
+                            common >= 512);
+    if (is_continuation) {
+        return 1000000 + common;
+    }
+    /* If this slot is NOT a continuation, evicting it wastes live_pos tokens.
+     * Score it negatively so idle slots (score 0) or slots with smaller cache
+     * are prioritized over destroying large active sessions. */
+    return -live_pos;
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -13787,6 +13885,9 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: [slot %d] dispatch job prompt=%d score=%d",
+                   chosen_slot->id, chosen->req.prompt.len, chosen_score);
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -14601,7 +14702,7 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--batched-session")) {
+        } else if (!strcmp(arg, "--batched-session") || !strcmp(arg, "--batched-sessions")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
@@ -16616,6 +16717,35 @@ static void test_api_thinking_controls_parse(void) {
     mode = DS4_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+
+    ds4_think_mode resp_effort = DS4_THINK_HIGH;
+    bool summary_in = false;
+    bool effort_seen = false;
+    const char *resp_json = "{\"effort\":\"max\",\"summary\":\"detailed\"}";
+    TEST_ASSERT(parse_responses_reasoning(&resp_json, &resp_effort, &summary_in, &effort_seen));
+    TEST_ASSERT(effort_seen);
+    TEST_ASSERT(summary_in);
+    TEST_ASSERT(resp_effort == DS4_THINK_MAX);
+    bool dyn_enabled = false;
+    if (effort_seen) {
+        if (resp_effort == DS4_THINK_NONE) dyn_enabled = false;
+        else dyn_enabled = true;
+    }
+    TEST_ASSERT(dyn_enabled);
+    TEST_ASSERT(think_mode_from_enabled(dyn_enabled, resp_effort) == DS4_THINK_MAX);
+
+    const char *none_json = "{\"effort\":\"none\"}";
+    effort_seen = false;
+    TEST_ASSERT(parse_responses_reasoning(&none_json, &resp_effort, NULL, &effort_seen));
+    TEST_ASSERT(effort_seen);
+    TEST_ASSERT(resp_effort == DS4_THINK_NONE);
+    dyn_enabled = true;
+    if (effort_seen) {
+        if (resp_effort == DS4_THINK_NONE) dyn_enabled = false;
+        else dyn_enabled = true;
+    }
+    TEST_ASSERT(!dyn_enabled);
+    TEST_ASSERT(think_mode_from_enabled(dyn_enabled, resp_effort) == DS4_THINK_NONE);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
