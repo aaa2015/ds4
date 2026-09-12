@@ -747,9 +747,9 @@ int ds4_kvstore_chat_latest_anchor_pos(const ds4_kvstore *kc,
 
     int last_user = -1;
     for (int i = last_assistant - 1; i >= 0; i--) {
+        if (prompt->v[i] == assistant_token_id) break;
         if (prompt->v[i] == user_token_id) {
             last_user = i;
-            break;
         }
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;

@@ -12689,11 +12689,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                             ds4_token_assistant(s->engine));
         if (anchor < s->kv.opt.min_tokens) {
             const int user_tok = ds4_token_user(s->engine);
+            const int asst_tok = ds4_token_assistant(s->engine);
             if (user_tok >= 0) {
                 for (int i = prompt_for_sync->len - 1; i >= 0; i--) {
+                    if (asst_tok >= 0 && prompt_for_sync->v[i] == asst_tok) break;
                     if (prompt_for_sync->v[i] == user_tok) {
                         if (i >= s->kv.opt.min_tokens) anchor = i;
-                        break;
                     }
                 }
             }
@@ -19515,6 +19516,32 @@ static void test_kv_cache_chat_latest_anchor_multiturn(void) {
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &single, user, assistant) == 2);
     TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &single, user, assistant) == 2);
 
+    /* Trailing context carrier (multiple user markers before pending assistant):
+     * The anchor must be the FIRST user marker of the turn, not the carrier. */
+    ds4_tokens single_carrier = {0};
+    ds4_tokens_push(&single_carrier, 1);
+    ds4_tokens_push(&single_carrier, 2);
+    ds4_tokens_push(&single_carrier, user);      /* user question at pos 2 */
+    ds4_tokens_push(&single_carrier, 3);
+    ds4_tokens_push(&single_carrier, user);      /* trailing context carrier at pos 4 */
+    ds4_tokens_push(&single_carrier, 4);
+    ds4_tokens_push(&single_carrier, assistant); /* pending generation at pos 6 */
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &single_carrier, user, assistant) == 2);
+
+    ds4_tokens multiturn_carrier = {0};
+    ds4_tokens_push(&multiturn_carrier, 1);
+    ds4_tokens_push(&multiturn_carrier, 2);
+    ds4_tokens_push(&multiturn_carrier, user);      /* first turn task at pos 2 */
+    ds4_tokens_push(&multiturn_carrier, 3);
+    ds4_tokens_push(&multiturn_carrier, assistant); /* first turn assistant at pos 4 */
+    ds4_tokens_push(&multiturn_carrier, 4);
+    ds4_tokens_push(&multiturn_carrier, user);      /* later user turn at pos 6 */
+    ds4_tokens_push(&multiturn_carrier, 5);
+    ds4_tokens_push(&multiturn_carrier, user);      /* trailing carrier at pos 8 */
+    ds4_tokens_push(&multiturn_carrier, 6);
+    ds4_tokens_push(&multiturn_carrier, assistant); /* pending generation at pos 10 */
+    TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &multiturn_carrier, user, assistant) == 6);
+
     /* min_tokens threshold */
     kc.opt.min_tokens = 7;
     TEST_ASSERT(kv_cache_chat_latest_anchor_pos(&kc, &prompt, user, assistant) == -1);
@@ -19523,6 +19550,8 @@ static void test_kv_cache_chat_latest_anchor_multiturn(void) {
 
     ds4_tokens_free(&prompt);
     ds4_tokens_free(&single);
+    ds4_tokens_free(&single_carrier);
+    ds4_tokens_free(&multiturn_carrier);
 }
 
 static void test_tokens_have_thinking_control_detection(void) {
