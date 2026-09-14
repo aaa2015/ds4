@@ -1010,6 +1010,7 @@ static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EX
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static id g_stream_slab_residency_set;
 static uint32_t g_stream_expert_cache_slab_start_slot[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slot_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slots_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
@@ -4409,6 +4410,13 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_buffer_allocs,
                     (unsigned long long)g_stream_expert_cache_buffer_reuses);
         }
+        if (g_stream_slab_residency_set) {
+            uint64_t bytes = 0;
+            for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++)
+                bytes += [g_stream_expert_cache_slabs[i] length];
+            fprintf(stderr, "ds4:   streaming slab residency: %u slabs, %.2f GiB allocations\n",
+                    g_stream_expert_cache_slab_count, ds4_gpu_gib(bytes));
+        }
         if (g_stream_expert_cache_mlock_bytes != 0 ||
             g_stream_expert_cache_mlock_failures != 0) {
             fprintf(stderr,
@@ -4680,7 +4688,9 @@ static const char *ds4_gpu_source =
 "#define QK_K 256\n"
 "#endif\n"
 "#define N_SIMDWIDTH 32\n"
+"#ifndef N_R0_Q8_0\n"
 "#define N_R0_Q8_0 2\n"
+"#endif\n"
 "#define N_SG_Q8_0 4\n"
 "#define FC_MUL_MV 600\n"
 "#define FC_MUL_MM 700\n"
@@ -5049,6 +5059,7 @@ typedef struct {
     int32_t  i10;
     float    alpha;
     float    limit;
+    int32_t  round_bf16;
 } ds4_gpu_glu_args;
 
 typedef struct {
@@ -5381,11 +5392,37 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
+    /* 行维切分 NR0 (每个 threadgroup 处理几行)。网格 = ceil(ne01/NR0),
+     * 而 NSG 个 simdgroup 是切 K 的 (见 dense.metal 的 shmem_f32[row][sgitg])
+     * -> 改 NR0 只改"谁算哪一行", 每行内部的 K 归约形状不变 => 位级一致。
+     * 缩小网格数可把输入向量的重复读取按 NR0 摊薄。必须与内核宏 N_R0_Q8_0 一致。 */
+    /* 2026-09-13: NR0 2 -> 4 (实测最优, 位级一致)。
+     * NR0 = 每个 threadgroup 处理几行; NSG 个 simdgroup 是切 K 的
+     * (见 dense.metal 的 shmem_f32[row][sgitg]) -> 改 NR0 只改"谁算哪一行",
+     * 每行内部的 K 归约形状不变 => 输出位级一致。
+     * 微基准 (8 组稠密 q8_0 × 40 层): NR0=2 -> 12.291ms; 4 -> 11.592ms (-5.7%);
+     * 8 -> 12.707ms。收益主要来自 attn_q_b (44.56MB/层, 471->604 GB/s):
+     * 缩小网格数把输入向量的重复读取按 NR0 摊薄。NR0=8 时网格过小反而退化。
+     * 按形状分别定 NR0 只能再多榨 1%, 不值得加内核实例化。
+     * 逃生阀: DS4_METAL_N_R0_Q8_0=2 恢复旧行为。 */
+    /* 默认 2 = 引擎原值。DS4_METAL_N_R0_Q8_0 是**实验开关, 不要当作已采纳项**:
+     * 2026-09-13 试过 4 —— 微基准(单形状隔离)显示 attn_q_b 471->604 GB/s、8 组合计
+     * -5.7%, 但端到端**既错又慢**(6 用例哈希全变、输出长度都不同; decode 21.15 vs 22.49)。
+     * 两个原因:
+     *  (1) N_R0_Q8_0 是 dense.metal 里 **8 个内核共用**的编译期常量。全局改 4 后,
+     *      共享专家的 down 路径 (kernel_dsv4_shared_down_q8_0_*) 宿主侧仍硬编码
+     *      "2 行 / 256 字节 threadgroup 内存", 而内核要 4 行 => **threadgroup 内存越界写
+     *      => 归约被污染** (静默出错, 不报错)。
+     *  (2) NR0 翻倍使 threadgroup 数减半, 而线程数 = grid*128 也减半 => 并行度腰斩,
+     *      只有最高的 attn_q_b 受益, 其余全亏。
+     * 要真正拿这 1.6%, 必须: 给主 matvec 单独一个常量(不与那 8 个内核共用) + 修正
+     * 那 3 处宿主硬编码(2 行/256B//2 网格)。性价比与风险都不划算, 故默认保持 2。 */
+    const uint64_t nr0 = ds4_gpu_env_u64("DS4_METAL_N_R0_Q8_0", 2u, 1u, 8u);
     return (ds4_gpu_mv_dispatch) {
         .function_name = "kernel_mul_mv_q8_0_f32",
         .nsg = nsg,
-        .nr0 = 2,
-        .smem = 32u * 2u * sizeof(float),
+        .nr0 = (int32_t)nr0,
+        .smem = 32u * (uint32_t)nr0 * sizeof(float),
     };
 }
 
@@ -5536,6 +5573,7 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    int32_t  round_bf16;   /* 非 0: store 前就地 BF16 舍入 (与 args 结构体同步) */
 } ds4_gpu_rms_norm_args;
 
 typedef struct {
@@ -5631,6 +5669,7 @@ typedef struct {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    int32_t  round_bf16;
 } ds4_gpu_hc_weighted_sum_args;
 
 typedef struct {
@@ -5692,6 +5731,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     int32_t has_add;
+    int32_t round_bf16;
 } ds4_gpu_hc_expand_args;
 
 typedef struct {
@@ -6886,6 +6926,29 @@ int ds4_gpu_init(void) {
                 options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
                 fprintf(stderr, "ds4: Metal shader library fast-math disabled by DS4_METAL_MATH_SAFE (pre-macOS 15)\n");
+            }
+        }
+
+        /* 2026-09-13: MoE matvec 的行维切分 (N_R0_*) 可调, 用于提高
+         * threadgroup 数与占用率。纯行切分 -> 每行的 K 归约形状不变, 结果位级一致。
+         * 默认仍是 moe.metal 里的 4 (即不传宏时行为完全不变)。 */
+        {
+            const char *v = getenv("DS4_METAL_N_R0_Q8_0");
+            if (v && v[0]) {
+                macros[@"N_R0_Q8_0"] = [NSString stringWithUTF8String:v];
+                fprintf(stderr, "ds4: Metal dense N_R0 override N_R0_Q8_0=%s\n", v);
+            }
+        }
+        {
+            const char *nr0_names[] = {"N_R0_Q2_K", "N_R0_IQ2_XXS"};
+            const char *nr0_envs[]  = {"DS4_METAL_N_R0_Q2_K", "DS4_METAL_N_R0_IQ2_XXS"};
+            for (int i = 0; i < 2; i++) {
+                const char *v = getenv(nr0_envs[i]);
+                if (v && v[0]) {
+                    macros[[NSString stringWithUTF8String:nr0_names[i]]] =
+                        [NSString stringWithUTF8String:v];
+                    fprintf(stderr, "ds4: Metal MoE N_R0 override %s=%s\n", nr0_names[i], v);
+                }
             }
         }
 
@@ -13829,6 +13892,17 @@ static uint64_t ds4_gpu_stream_expert_slab_target_bytes(void) {
     return target;
 }
 
+static void ds4_gpu_stream_slab_residency_clear(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_stream_slab_residency_set) {
+            [g_queue removeResidencySet:g_stream_slab_residency_set];
+            g_stream_slab_residency_set = nil;
+        }
+    }
+#endif
+}
+
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
         uint64_t  len,
         NSString *label) {
@@ -13848,6 +13922,36 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
     }
     buffer.label = label;
     g_stream_expert_cache_buffer_allocs++;
+    if (getenv("DS4_METAL_STREAMING_SLAB_RESIDENCY") &&
+        !g_stream_expert_cache_mlock_relief_applied) {
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            const BOOL fresh = g_stream_slab_residency_set == nil;
+            if (fresh) {
+                MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+                desc.label = @"ds4_streaming_expert_slabs";
+                desc.initialCapacity = 64;
+                NSError *error = nil;
+                g_stream_slab_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+                if (!g_stream_slab_residency_set) {
+                    fprintf(stderr, "ds4: streaming slab residency set failed: %s\n",
+                            [[error localizedDescription] UTF8String]);
+                    return nil;
+                }
+            }
+            /* Only owned cache slabs belong here, never disk-backed model
+             * views. Keep registration across slot reuse; clear it with the
+             * physical slab pool after outstanding GPU work has drained.
+             * Queue attachment covers each submission without a separate
+             * explicit requestResidency lifetime. */
+            [g_stream_slab_residency_set addAllocation:buffer];
+            [g_stream_slab_residency_set commit];
+            if (fresh) {
+                [g_queue addResidencySet:g_stream_slab_residency_set];
+            }
+        }
+#endif
+    }
     return buffer;
 }
 
@@ -15136,6 +15240,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     }
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
+    ds4_gpu_stream_slab_residency_clear();
     for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
@@ -15677,6 +15782,9 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
 
     if (released == 0) return 0;
     g_stream_expert_cache_mlock_relief_applied = 1;
+    /* Let released slots become reclaimable instead of requesting the whole
+     * pool again on every submission. A cache rebuild can enable residency. */
+    ds4_gpu_stream_slab_residency_clear();
 
     uint32_t cap = g_stream_expert_cache_entry_count;
     const uint32_t locked_after =
@@ -22142,6 +22250,17 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
     return 1;
 }
 
+static int ds4_gpu_rms_norm_weight_rows_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps,
+        int                     round_bf16);
+
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -22153,6 +22272,18 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
+int ds4_gpu_rms_norm_weight_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps) {
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size, weight_offset,
+                                            n, 1, eps, 1);
+}
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -22162,6 +22293,20 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps) {
+    return ds4_gpu_rms_norm_weight_rows_impl(out, x, model_map, model_size, weight_offset,
+                                            n, rows, eps, 0);
+}
+
+static int ds4_gpu_rms_norm_weight_rows_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps,
+        int                     round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
@@ -22190,6 +22335,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, rows, eps);
+        args.round_bf16 = round_bf16;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -30941,6 +31087,27 @@ int ds4_gpu_attention_decode_heads_tensor(
     return 1;
 }
 
+/* 新入口: SwiGLU 后顺带做一次就地 BF16 舍入, 逐位等价于随后单独调用
+ * ds4_gpu_dsv41_quantize(..., DS4_V41_BF16); 目的只是省掉那次纯开销 dispatch。 */
+static int ds4_gpu_swiglu_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight,
+        int                     round_bf16);
+
+int ds4_gpu_swiglu_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight) {
+    return ds4_gpu_swiglu_impl(out, gate, up, n, clamp, weight, 1);
+}
+
 int ds4_gpu_swiglu_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
@@ -30948,6 +31115,17 @@ int ds4_gpu_swiglu_tensor(
         uint32_t                n,
         float                   clamp,
         float                   weight) {
+    return ds4_gpu_swiglu_impl(out, gate, up, n, clamp, weight, 0);
+}
+
+static int ds4_gpu_swiglu_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight,
+        int                     round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || n == 0) return 0;
     if (!isfinite(clamp) || clamp < 0.0f || !isfinite(weight)) return 0;
@@ -30980,6 +31158,7 @@ int ds4_gpu_swiglu_tensor(
             .i10 = 0,
             .alpha = weight,
             .limit = clamp,
+            .round_bf16 = round_bf16,
         };
         NSUInteger nth = g_swiglu_flat_pipeline.maxTotalThreadsPerThreadgroup;
         if (nth > 256u) nth = 256u;
@@ -31393,7 +31572,24 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_MXFP4:   return 2;
     case DS4_METAL_TENSOR_Q2_K:
-    case DS4_METAL_TENSOR_IQ2_XXS: return 4;
+    case DS4_METAL_TENSOR_IQ2_XXS: {
+        /* 2026-09-13: 必须与 metal/moe.metal 里同名编译器宏取值一致,
+         * 否则宿主按 nr0=4 算网格、内核只算 N_R0 行 -> 少算行。 */
+        const char *env = getenv(type == DS4_METAL_TENSOR_Q2_K
+                                 ? "DS4_METAL_N_R0_Q2_K" : "DS4_METAL_N_R0_IQ2_XXS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end && *end == '\0' && v >= 1 && v <= 8) return (uint32_t)v;
+            fprintf(stderr, "ds4: ignoring invalid %s=%s\n",
+                    type == DS4_METAL_TENSOR_Q2_K ? "DS4_METAL_N_R0_Q2_K"
+                                                  : "DS4_METAL_N_R0_IQ2_XXS", env);
+        }
+        /* 默认必须与 metal/moe.metal 的同名宏一致。
+         * Q2_K (down 投影, sum6 家族无专家维并行) 网格过小 -> 2;
+         * IQ2_XXS (gate/up, pair 家族网格里已有 6 个专家维) 实测减小更慢 -> 保持 4。 */
+        return type == DS4_METAL_TENSOR_Q2_K ? 2u : 4u;
+    }
     default:                       return 0;
     }
 }
@@ -44410,6 +44606,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
+        int                     round_bf16,
         const char             *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
@@ -44465,6 +44662,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .nb_w1 = weight_row_stride,
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
+            .round_bf16 = round_bf16,
         };
         const uint64_t n_elem = (uint64_t)n_embd * n_tokens64;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
@@ -44489,6 +44687,31 @@ static int ds4_gpu_hc_weighted_sum_strided(
     return 1;
 }
 
+int ds4_gpu_hc_weighted_sum_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_weighted_sum_strided(out, residual_hc, weights, 0,
+                                             (uint64_t)n_hc * sizeof(float),
+                                             n_embd, n_hc, 1,
+                                             "HC weighted sum round");
+}
+
+int ds4_gpu_hc_weighted_sum_split_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    return ds4_gpu_hc_weighted_sum_strided(out, residual_hc, split, 0,
+                                             mix_hc * sizeof(float),
+                                             n_embd, n_hc, 1,
+                                             "HC weighted sum split round");
+}
+
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -44502,6 +44725,7 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
                                              "HC weighted sum");
 }
 
@@ -44519,6 +44743,7 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
                                              "HC weighted sum split");
 }
 
@@ -45691,6 +45916,27 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
+static int ds4_gpu_hc_expand_split_impl(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int                     round_bf16);
+
+/* 新入口: HC expand 后顺带就地 BF16 舍入 (省掉一次纯开销 dispatch)。 */
+int ds4_gpu_hc_expand_split_round_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_split_impl(out_hc, block_out, residual_hc, split,
+                                        n_embd, n_hc, 1);
+}
+
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
@@ -45698,6 +45944,18 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_split_impl(out_hc, block_out, residual_hc, split,
+                                        n_embd, n_hc, 0);
+}
+
+static int ds4_gpu_hc_expand_split_impl(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        int                     round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) {
         fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
         return 0;
@@ -45769,6 +46027,7 @@ int ds4_gpu_hc_expand_split_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 0,
+            .round_bf16 = round_bf16,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;

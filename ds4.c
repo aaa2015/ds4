@@ -39119,6 +39119,9 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     return cap > chunk ? (uint32_t)cap : 0;
 }
 
+/* engram_rows_alt: 第二张 Engram 表的独立行缓冲 (24 KB, 每图各一份)。
+ * 第 1 层用 engram_rows、第 14 层用 engram_rows_alt —— 两者不再别名, 因此层循环中
+ * 无需为“覆写共享输入”而在 il==13 排空 GPU 管线。 */
 #define DS41_SCRATCH(X) \
     X(image_text_mask, (g->prefill_cap + 3u) / 4u) \
     X(residual, DS4_N_HC * DS4_N_EMBD) \
@@ -39146,6 +39149,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
+    X(engram_rows_alt, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
@@ -39387,7 +39391,12 @@ fail:
 }
 #undef DS41_SCRATCH
 
+/* 诊断开关 (2026-09-13): 把所有就地 BF16 舍入变成 no-op, 用来**测量**这些
+ * 舍入 dispatch 到底占多少时间。数值上故意错误, 只用于标定收益上限 ——
+ * 若收益不显著, 就不值得为「融合进生产者内核」付出改动代价。
+ * 不设此 env 时行为完全不变。 */
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
+    if (getenv("DS4_METAL_SKIP_V41_BF16_ROUND")) return true;
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
@@ -39499,8 +39508,52 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
     return ds4_gpu_add_tensor(x, first, second, DS4_N_EMBD) != 0;
 }
 
+/* 2026-09-13: 把 ds41_norm 的 BF16 舍入融合进 rms_norm 的 store 尾声 ——
+ * 消掉每层约 5 个纯开销 dispatch (报告 §15.6: 每 token 2852 dispatch, 其中
+ * bf16_linear 789 个, 每个 5.6 µs 且 GPU 几乎全串行)。
+ * 舍入用整数位运算逐位复刻 kernel_dsv41_bf16_linear, 因此结果与
+ * 「先写 F32 再单独舍入」**逐字节相同**; 实测 6 用例一致。
+ * 逃生阀: DS4_METAL_DISABLE_V41_FUSED_BF16_NORM 恢复旧的两段式。 */
+static bool ds41_bf16_fused_enabled(void) {
+    return getenv("DS4_METAL_DISABLE_V41_FUSED_BF16_NORM") == NULL;
+}
+
+/* ---- BF16 舍入融合 (2026-09-13, 报告 §15.8/§15.9) -------------------------
+ * 把「生产者写 F32 → 再起一个 dispatch 就地舍入」改成生产者直接写 BF16。
+ * 舍入逐位复刻 kernel_dsv41_bf16_linear, 结果与两段式逐字节相同。
+ * 同一开关也管 ds41_norm; 设 DS4_METAL_DISABLE_V41_FUSED_BF16_NORM 恢复两段式。 */
+static bool ds41_hc_ws_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *res,
+                             const ds4_gpu_tensor *w, uint32_t n_hc, bool split) {
+    if (ds41_bf16_fused_enabled())
+        return split ? ds4_gpu_hc_weighted_sum_split_round_tensor(out, res, w, DS4_N_EMBD, n_hc)
+                     : ds4_gpu_hc_weighted_sum_round_tensor(out, res, w, DS4_N_EMBD, n_hc);
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, res, w, DS4_N_EMBD, n_hc)
+                  : ds4_gpu_hc_weighted_sum_tensor(out, res, w, DS4_N_EMBD, n_hc)) &&
+           ds41_bf16(out, DS4_N_EMBD);
+}
+
+static bool ds41_hc_expand_round(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block,
+                                 const ds4_gpu_tensor *res, const ds4_gpu_tensor *split,
+                                 uint32_t n_hc) {
+    if (ds41_bf16_fused_enabled())
+        return ds4_gpu_hc_expand_split_round_tensor(out_hc, block, res, split, DS4_N_EMBD, n_hc);
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block, res, split, DS4_N_EMBD, n_hc) &&
+           ds41_bf16(out_hc, DS4_N_EMBD * n_hc);
+}
+
+static bool ds41_swiglu_round(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate,
+                              const ds4_gpu_tensor *up, uint32_t width) {
+    if (ds41_bf16_fused_enabled())
+        return ds4_gpu_swiglu_round_tensor(out, gate, up, width, DS4_SWIGLU_CLAMP_EXP, 1.0f);
+    return ds4_gpu_swiglu_tensor(out, gate, up, width, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+           ds41_bf16(out, width);
+}
+
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+    if (ds41_bf16_fused_enabled())
+        return ds4_gpu_rms_norm_weight_round_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
@@ -39688,9 +39741,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
+        !ds41_swiglu_round(g->shared_mid, g->shared_gate, g->shared_up, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -39711,8 +39762,8 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+    bool ok = ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false) &&
+              ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_matmul(g->logits, m, w->output, g->norm, false);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
@@ -39729,17 +39780,16 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false) &&
+        ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand_round(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_HC) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds41_hc_ws_round(g->x, g->after_attn, g->attn_split, DS4_N_HC, true) &&
+        ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -39956,7 +40006,24 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     ds41_gpu_graph row = *g;
     const bool batch_index = ds41_index_source(il) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
-    const bool batch_publish = ratio == 2u && ds41_kv_source(il) &&
+    /* 2026-09-13: ratio == 2u 门槛过严。layer 20 是全部 40 层中**唯一**
+     * 「ratio=1 且 kv 源」的层 (FLASH41: ratio = il<2?0 : il<20?2 : 1;
+     * kv 源 = {2,8,14,20}), 被挡在批处理之外 → 退回逐 token 发布,
+     * 每 token 11 个 GPU op (2048 token = 22528 次/帧)。实测 attention
+     * core/index: layer 20 为 312 us/行, 同类 idx 源层 (24/28/32/36, 均
+     * ratio=1) 为 94 us/行且离散仅 0.7% —— 差额即这次发布。
+     * ds41_attention_publish_batch 本身已含 ratio != 2 的分支
+     * (else if (project_rows(b->latent, ...))), 且解码器路径的调用点
+     * (见 ds41_decoder_prepare) 的门槛并无 ratio 限制 —— 即该路径本就是活代码。
+     * 实测 (2026-09-13, 单 31965-token prompt): 开启后 layer 20 降至
+     * 154 us/行 (-50.7%), prefill 252.2 -> 263.8 t/s (+4.6%), 且 6 用例
+     * (含 24k) 与默认/改动前**逐字节一致**。
+     * 2026-09-13 审后已**设为默认**; DS4_METAL_DISABLE_V41_BATCH_COMPRESS_RATIO1
+     * 可回退到旧的逐 token 行为以便对照。 */
+    const bool ratio1_batch_off =
+        getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS_RATIO1") != NULL;
+    const bool batch_publish = ds41_kv_source(il) && ratio != 0u &&
+        (ratio == 2u || !ratio1_batch_off) &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
     for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
@@ -40013,8 +40080,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand_round(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_HC) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
@@ -40090,12 +40156,44 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    /* 可选 decode 计时 (DS4_V41_DECODE_TIMING=1): 拆出 engram / 层 / 输出头 三段,
+     * 因为 V4.1 decode 没有现成的阶段剖析器 (graph_step 不走 metal_graph_layer)。 */
+    const bool timing = getenv("DS4_V41_DECODE_TIMING") != NULL;
+    double t_engram = 0.0, t0 = 0.0;
+    if (timing) t0 = now_sec();
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+    if (!ds41_image_at(g, g->pos)) {
+        /* 走批量接口而非 ds4_engram_read: 后者是逐行串行 pread。
+         * decode 单 token = 1 x DS4_ENGRAM_COLS 行/表, 两张表共 48 行。 */
+        for (uint32_t i = 0; i < 2; i++) {
+            if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS,
+                                       g->rows[i])) return false;
+        }
     }
+    if (timing) t_engram = now_sec() - t0;
+    /* 双缓冲的用途: 两张 Engram 表的行在层循环之前一次性写入**各自**缓冲,
+     * 循环中不再覆写共享输入, 从而让上方的 mid_drain 成为冗余。
+     *
+     * 但实测 (报告 §6.4) 它**不该开**: 那个排空点是**免费**的 ——
+     *   CPU 编码 40 层与分两段编码 14+26 层耗时相同 (2.40 / 2.52 / 2.33 ms),
+     *   编码期间 GPU 本来就无事可做 (token 内自回归串行: logits→采样→embed)。
+     *   双缓冲反而多 0.5 ms 的 **GPU** 开销 (机制未定位, 疑与第二个 24KB 缓冲
+     *   的访存局部性有关)。
+     * 故默认关闭; 真正消除硬编码脆弱性的是**语义化排空条件** (零成本)。已实现保留,
+     * 作为隔离杠杆与未来备选 (若 Engram 表增到 3 张, 它是现成方案)。 */
+    const bool engram_double_buffer =
+        getenv("DS4_METAL_ENABLE_V41_ENGRAM_DOUBLE_BUFFER") != NULL;
+    /* 逃生阀: 即使双缓冲也强制保留 Engram 边界处的排空 (A/B 与旧调度回退)。 */
+    const bool engram_force_mid_drain =
+        getenv("DS4_METAL_FORCE_V41_ENGRAM_MID_DRAIN") != NULL;
+    if (engram_double_buffer && !ds41_image_at(g, g->pos)) {
+        if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[0], sizeof(g->rows[0])) ||
+            !ds4_gpu_tensor_write(g->engram_rows_alt, 0, g->rows[1], sizeof(g->rows[1])))
+            return false;
+    }
+    bool engram_swapped = false;
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
@@ -40104,21 +40202,53 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    const bool queue_layers = !g->imatrix &&
+        ((g->tp_world == 2 && !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE")) ||
+         (g->tp_world == 1 && g->streaming && !g->quality &&
+          getenv("DS4_METAL_ENABLE_V41_STREAM_DECODE_QUEUE")) ||
+         /* 2026-09-13: 全驻留 (非流式) 单卡默认开启跨层排队。
+          * 原逻辑仅 TP/流式排队, 非流式路径每层都 drain 一次 —— 40 次 GPU 气泡/token。
+          * 实测 (M2 Ultra, 8k ctx, 贪心): 16.38 -> 21.61 t/s (+31.9%), 输出逐字节一致。
+          * 安全性: 非流式层路径无 CPU 回读; 剩下的唯一排空依赖是 Engram 共享缓冲复用,
+          * 由下方 mid_drain 的**语义化条件**挡住 (不再硬编码 il == 13)。
+          * 逃生阀: DS4_METAL_DISABLE_V41_RESIDENT_DECODE_QUEUE。 */
+         (g->tp_world == 1 && !g->streaming && !g->quality &&
+          !getenv("DS4_METAL_DISABLE_V41_RESIDENT_DECODE_QUEUE")));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
-        if (ok && ds41_engram_layer(il)) {
+        if (ok && engram_double_buffer && ds41_engram_layer(il) && il != 1u) {
+            /* 后续 Engram 表 (当前为第 14 层) 改从自己的缓冲读取。两个缓冲都在
+             * 循环前写入、且循环中不再覆写, 所以这里只需切换指针, 不必等待在途 GPU。 */
+            ds4_gpu_tensor *swap = g->engram_rows;
+            g->engram_rows = g->engram_rows_alt;
+            g->engram_rows_alt = swap;
+            engram_swapped = true;
+        }
+        if (ok && !engram_double_buffer && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
-        /* TP gates already submit ordered, bounded command buffers. Drain
-         * before overwriting the first Engram table's shared input at layer
-         * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        /* TP gates and streaming selected-ID readback bound queued work. Drain
+         * before publishing the completed token to the CPU.
+         *
+         * 排空条件**不硬编码层号**: 任何“即将写入后续 Engram 表”的边界都会触发,
+         * 所以上游改动 Engram 层号 (或增加到第 3 张表) 时仍然正确。
+         *
+         * 实测 (报告 §6.4): 这个边界排空是**免费的** —— CPU 编码耗时 2.40 ms
+         * 不随分段数变化, 编码期间 GPU 本就无事可做 (token 内自回归串行)。
+         * 双缓冲 (engram_double_buffer, 默认关) 能消掉该排空, 但实测 −0.9%
+         * (差异在 GPU 侧), 故默认关闭; 开启后可用 force 逃生阀把排空加回来。 */
+        const bool engram_upload_next = il + 1u < DS4_N_LAYER &&
+            ds41_engram_layer(il + 1u) && (il + 1u) != 1u;
+        /* mid_drain: 仅在“即将写入后续 Engram 表”的边界排空。
+         * 注意 engram_force_mid_drain 只是把该边界排空加回来, 不可写成常量 true ——
+         * 那会退化成“每层都排空”(实测 18.06 t/s)。 */
+        const bool mid_drain = engram_upload_next &&
+            (!engram_double_buffer || engram_force_mid_drain);
+        const bool drain = !queue_layers || il + 1u == DS4_N_LAYER || mid_drain;
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -40128,10 +40258,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    if (engram_swapped) {
+        /* 恢复不变量: engram_rows 恒为第 1 张表的缓冲, 供下一个 token 使用。 */
+        ds4_gpu_tensor *swap = g->engram_rows;
+        g->engram_rows = g->engram_rows_alt;
+        g->engram_rows_alt = swap;
+        engram_swapped = false;
+    }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (timing && ok) {
+        const double total = now_sec() - t0;
+        fprintf(stderr,
+                "ds4: v41 decode timing pos=%u engram=%.3f ms layers=%.3f ms head=%.3f ms total=%.3f ms\n",
+                g->pos, t_engram * 1000.0, (total - t_engram) * 1000.0, 0.0, total * 1000.0);
+    }
     if (!ok) {
         g->valid = false;
         return false;
@@ -40786,6 +40929,10 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    /* 可选计时: DS4_V41_DECODE_TIMING=1 (批量路径 = server 实际热路径)。
+     * 只测 engram 读与整体, 用于定位 decode 时间去向。 */
+    const bool bt_timing = getenv("DS4_V41_DECODE_TIMING") != NULL;
+    double bt_engram = 0.0, bt_t0 = bt_timing ? now_sec() : 0.0;
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
@@ -40795,8 +40942,13 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
+        const double bt_e0 = bt_timing ? now_sec() : 0.0;
         for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+            /* 批量接口而非逐行串行 pread (与 ds41_graph_step 一致):
+             * count=1 时 = 1 x DS4_ENGRAM_COLS 行/表, 两张表共 48 行。 */
+            ok = ds4_engram_read_batch(&s->table[table], ids[table], 1, DS4_ENGRAM_COLS,
+                                       disk_rows[table]);
+        if (bt_timing) bt_engram += now_sec() - bt_e0;
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
@@ -40877,6 +41029,13 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         ds4_gpu_tensor_free(heads[i]);
     }
     free(engram);
+    if (bt_timing && count > 0) {
+        const double bt_total = now_sec() - bt_t0;
+        fprintf(stderr,
+                "ds4: v41 batch timing rows=%d prefill_rows=%u engram=%.3f ms total=%.3f ms rest=%.3f ms\n",
+                count, prefill_rows, bt_engram * 1000.0, bt_total * 1000.0,
+                (bt_total - bt_engram) * 1000.0);
+    }
     return ok;
 }
 #undef DS41_PREFILL_ROWS

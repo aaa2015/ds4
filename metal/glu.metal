@@ -9,6 +9,7 @@ struct ds4_metal_args_glu {
     int32_t  i10;
     float    alpha;
     float    limit;
+    int32_t  round_bf16;
 };
 
 // SwiGLU activation for the FFN inner state. DS4 clamps the shared expert with
@@ -39,6 +40,25 @@ kernel void kernel_swiglu_f32(
     }
 }
 
+// 与 kernel_dsv41_bf16_linear 逐位相同的 BF16 舍入 (round-to-nearest-even,
+// 低位清零)。必须用整数位运算而非 metal 的 bfloat 转换 —— 后者在平局处的
+// 取舍规则不保证一致。
+// 所有 .metal 会被拼成同一个编译单元, 故用宏守卫避免重复定义。
+#ifndef DSV41_BF16_ROUND_HELPER_DEFINED
+#define DSV41_BF16_ROUND_HELPER_DEFINED
+static inline float dsv41_bf16_round_f32(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    }
+    return as_type<float>(bits & 0xffff0000u);
+}
+static inline float4 dsv41_bf16_round_f32x4(float4 v) {
+    return float4(dsv41_bf16_round_f32(v.x), dsv41_bf16_round_f32(v.y),
+                  dsv41_bf16_round_f32(v.z), dsv41_bf16_round_f32(v.w));
+}
+#endif
+
 kernel void kernel_swiglu_flat_f32(
         constant ds4_metal_args_glu & args,
         device const char * src0,
@@ -59,5 +79,6 @@ kernel void kernel_swiglu_flat_f32(
     }
 
     const float silu = x0 / (1.0f + exp(-x0));
-    dst_f32[i] = silu*x1*args.alpha;
+    const float glu_v = silu*x1*args.alpha;
+    dst_f32[i] = args.round_bf16 ? dsv41_bf16_round_f32(glu_v) : glu_v;
 }

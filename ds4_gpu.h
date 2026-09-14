@@ -1175,6 +1175,18 @@ int ds4_gpu_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps);
 
+/* 同 ds4_gpu_rms_norm_weight_tensor, 但在 store 前就地做 BF16 舍入 ——
+ * 逐位等价于随后单独调用一次 ds4_gpu_dsv41_quantize(..., DS4_V41_BF16),
+ * 目的只是省掉那次纯开销的 dispatch。 */
+int ds4_gpu_rms_norm_weight_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -2906,6 +2918,38 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps);
+
+/* 把「生产者写 F32 → 再起一个 dispatch 就地 BF16 舍入」合并成一次 store。
+ * 舍入逐位复刻 kernel_dsv41_bf16_linear, 故与两段式逐字节等价 (报告 §15.9)。 */
+int ds4_gpu_swiglu_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight);
+
+int ds4_gpu_hc_weighted_sum_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_weighted_sum_split_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_expand_split_round_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
 
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,

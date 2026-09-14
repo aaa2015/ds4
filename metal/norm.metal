@@ -11,7 +11,30 @@ struct ds4_metal_args_norm {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    // 非 0 时在 store 前做就地 BF16 舍入, 复刻 kernel_dsv41_bf16_linear。
+    // 目的: 把「写 F32 再起一个 dispatch 就地舍入」融合成一次 store,
+    // 消掉每层约 5 个纯开销 dispatch (见报告 §15.6)。
+    int32_t  round_bf16;
 };
+
+// 与 kernel_dsv41_bf16_linear 逐位相同的 BF16 舍入 (round-to-nearest-even,
+// 低位清零)。必须用整数位运算而非 metal 的 bfloat 转换 —— 后者在平局处的
+// 取舍规则不保证一致。
+// 所有 .metal 会被拼成同一个编译单元, 故用宏守卫避免重复定义。
+#ifndef DSV41_BF16_ROUND_HELPER_DEFINED
+#define DSV41_BF16_ROUND_HELPER_DEFINED
+static inline float dsv41_bf16_round_f32(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    }
+    return as_type<float>(bits & 0xffff0000u);
+}
+static inline float4 dsv41_bf16_round_f32x4(float4 v) {
+    return float4(dsv41_bf16_round_f32(v.x), dsv41_bf16_round_f32(v.y),
+                  dsv41_bf16_round_f32(v.z), dsv41_bf16_round_f32(v.w));
+}
+#endif
 
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
@@ -65,16 +88,19 @@ kernel void kernel_rms_norm_fuse_impl(
     const float scale = 1.0f/sqrt(mean + args.eps);
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    const bool round_bf16 = args.round_bf16 != 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        T v;
         if (F == 1) {
-            y[i00] = (x[i00]*scale);
+            v = (x[i00]*scale);
         }
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            v = (x[i00]*scale)*f0[i00];
         }
         if (F == 3) {
-            y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
+            v = (x[i00]*scale)*f0[i00] + f1[i00];
         }
+        y[i00] = round_bf16 ? dsv41_bf16_round_f32x4(v) : v;
     }
 }
 

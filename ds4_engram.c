@@ -102,7 +102,18 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
         goto fail;
     }
 #ifdef __APPLE__
-    if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
+    /* F_NOCACHE: 每次读都绕过统一缓冲区缓存直打 SSD。行读取尺寸仅 264 B,
+     * 远低于 SSD 最小高效读粒度, 且 decode 每 token 要读 48 行 —— 全部走磁盘延迟。
+     * 保留为默认 (尊重上游原意), 但允许 DS4_ENGRAM_NOCACHE=0 开启页缓存做 A/B。 */
+    const char *nocache_env = getenv("DS4_ENGRAM_NOCACHE");
+    bool want_nocache = true;
+    if (nocache_env && (nocache_env[0] == '0' || nocache_env[0] == 'n' ||
+                        nocache_env[0] == 'N' || nocache_env[0] == 'f' ||
+                        nocache_env[0] == 'F')) {
+        want_nocache = false;
+    }
+    if (want_nocache &&
+        (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0)) goto fail;
 #endif
     *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows};
     return true;
@@ -254,8 +265,22 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
 #ifdef __APPLE__
         /* Fixed concurrency hides random-read latency without caching the table.
-         * Each worker owns disjoint output rows; all finish before GPU use. */
-        if (count >= 256) {
+         * Each worker owns disjoint output rows; all finish before GPU use.
+         *
+         * 阈值可调 (DS4_ENGRAM_CONCURRENT_MIN, 默认 16)。decode 单 token 只有
+         * 1 x DS4_ENGRAM_COLS = 24 行, 原阈值 256 使它长期停在串行路径 ——
+         * 每 token 48 次串行未缓存 pread, 实测 4.89 ms/token。 */
+        static long concurrent_min = -1;
+        if (concurrent_min < 0) {
+            concurrent_min = 16;
+            const char *env = getenv("DS4_ENGRAM_CONCURRENT_MIN");
+            if (env && env[0]) {
+                char *end = NULL;
+                long v = strtol(env, &end, 10);
+                if (end != env && *end == '\0' && v >= 0 && v <= 1000000) concurrent_min = v;
+            }
+        }
+        if ((long)count >= concurrent_min) {
             batch.readers = ENGRAM_READERS;
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);

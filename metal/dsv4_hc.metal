@@ -1,3 +1,22 @@
+// 与 kernel_dsv41_bf16_linear 逐位相同的 BF16 舍入 (round-to-nearest-even,
+// 低位清零)。必须用整数位运算而非 metal 的 bfloat 转换 —— 后者在平局处的
+// 取舍规则不保证一致。
+// 所有 .metal 会被拼成同一个编译单元, 故用宏守卫避免重复定义。
+#ifndef DSV41_BF16_ROUND_HELPER_DEFINED
+#define DSV41_BF16_ROUND_HELPER_DEFINED
+static inline float dsv41_bf16_round_f32(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    }
+    return as_type<float>(bits & 0xffff0000u);
+}
+static inline float4 dsv41_bf16_round_f32x4(float4 v) {
+    return float4(dsv41_bf16_round_f32(v.x), dsv41_bf16_round_f32(v.y),
+                  dsv41_bf16_round_f32(v.z), dsv41_bf16_round_f32(v.w));
+}
+#endif
+
 struct ds4_metal_args_dsv4_hc_split_sinkhorn {
     int32_t  n_hc;
     int32_t  sinkhorn_iters;
@@ -19,6 +38,7 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    int32_t  round_bf16;
 };
 
 
@@ -81,6 +101,7 @@ struct ds4_metal_args_dsv4_hc_expand {
     uint64_t nb1;
     uint64_t nb2;
     int32_t  has_add;
+    int32_t  round_bf16;
 };
 
 // Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
@@ -688,7 +709,8 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) =
+            args.round_bf16 ? dsv41_bf16_round_f32(acc) : acc;
     }
 }
 
@@ -1067,7 +1089,9 @@ kernel void kernel_dsv4_hc_weighted_sum(
         acc += xv * wv;
     }
 
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    const float ws_v = acc;
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) =
+        args.round_bf16 ? dsv41_bf16_round_f32(ws_v) : ws_v;
 }
 
 // The one-row HC=4 output head historically materializes four device-F32

@@ -4,7 +4,15 @@
 #define QK_K 256
 #endif
 #define QK_MXFP4 32
-#define N_R0_Q2_K 4
+/* 2026-09-13: 4 -> 2。Q2_K 只用于 routed-MoE 的 down 投影, 其 sum6 家族
+ * 把 6 个专家在 threadgroup 内部串行循环, 网格只有 ceil(ne01/(nr0*nsg))
+ * 个 threadgroup (V4.1: 5120/(4*2)=640, 远少于 GPU 容量) -> 占用率严重不足。
+ * 行维切分减半 -> 网格翻倍到 1280。**纯行切分, 每行的 K 归约形状不变,
+ * 输出位级一致**(3 个确定性用例实测哈希完全相同), decode 实测 +1.6%。
+ * 可用 -D 宏 / DS4_METAL_N_R0_Q2_K 覆盖回 4。 */
+#ifndef N_R0_Q2_K
+#define N_R0_Q2_K 2
+#endif
 #define N_R0_GLM_Q2_PAIR2_K 1
 #define N_R0_Q4_K 2
 #define N_R0_Q8_K 2
@@ -13,7 +21,9 @@
 #define N_R0_Q5_PAIR_K 4
 #define N_R0_Q5_K 4
 #define N_R0_Q6_K 2
+#ifndef N_R0_IQ2_XXS
 #define N_R0_IQ2_XXS 4
+#endif
 #define N_R0_MXFP4 2
 
 static constant float ds4_metal_mxfp4_values[16] = {
