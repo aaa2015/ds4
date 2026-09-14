@@ -40250,6 +40250,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             (!engram_double_buffer || engram_force_mid_drain);
         const bool drain = !queue_layers || il + 1u == DS4_N_LAYER || mid_drain;
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        /* 2026-09-14 采纳上游 PR#1041 的 flush (仅此 6 行; 其 queue 部分我们早有且更稳)。
+         * 非排空层**提交但不等**: GPU 立刻开始跑本层, CPU 同时编码下一层, 消除
+         * CPU 编码期间 GPU 空闲的气泡。上游实测 (M3 Ultra, Q4 全驻留) 21.6 -> 23.1 t/s,
+         * 贪心输出逐字节一致; 其时间线为 36.9 ms GPU 忙 / 37.7 ms 跨度。
+         * 语义依据: ds4_gpu_flush_commands() 只 commit 并入 pending, 不等待;
+         *           ds4_gpu_end_commands() 才真正等完成 (已核对 ds4_metal.m)。
+         * 逃生阀: DS4_METAL_DISABLE_V41_DECODE_FLUSH。 */
+        if (ok && !drain && queue_layers && !layer_resident &&
+            !getenv("DS4_METAL_DISABLE_V41_DECODE_FLUSH") && !ds4_gpu_flush_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
