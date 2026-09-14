@@ -199,15 +199,63 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
-enum { ENGRAM_READERS = 16 };
+/* Bounded concurrent pread readers for the batched path.
+ *
+ * The reader count is chosen by read size, because the two workloads want
+ * opposite things.  This only changes how the rows of one read are partitioned
+ * across readers; every row's arithmetic is untouched, so output stays
+ * bit-identical (verified by hash across every reader count below).
+ *
+ *  - Small reads (exactly one token of columns, 24 rows, the per-token decode
+ *    path): 8 readers.  Measured 0.741 ms versus 0.805 ms at 16 readers (+8%).
+ *    With so few rows the fixed cost of dispatch_apply_f dominates, so extra
+ *    threads cost more than they save.
+ *  - Every larger read: 16 readers.  The limit is SSD random-read latency
+ *    (~130 us per 264-byte uncached pread), which needs enough concurrency to
+ *    hide.  A crossover sweep (rows: 8 / 16 / 32 readers, ms) measured
+ *    24: 0.741 / 0.805 / 0.926, 48: 1.505 / 1.181 / 1.164,
+ *    96: 2.903 / 1.990 / 2.098, 192: 5.515 / 4.159 / 3.791,
+ *    768: 20.837 / 12.720 / 12.576, 1536: 40.567 / 25.445 / 25.411.
+ *    8 readers wins only at 24 rows and is 28% slower at 48, so the small
+ *    bucket is deliberately narrow; from 48 rows up 16 and 32 alternate within
+ *    ~3%, and 16 wins on thread count.
+ *
+ * Runtime overrides: DS4_ENGRAM_READERS_SMALL / DS4_ENGRAM_READERS_LARGE
+ * (setting both to 16 restores the previous uniform behaviour). */
+#ifndef ENGRAM_READERS_SMALL
+#define ENGRAM_READERS_SMALL 8
+#endif
+#ifndef ENGRAM_READERS_LARGE
+#define ENGRAM_READERS_LARGE 16
+#endif
+
+enum { ENGRAM_READERS_MAX = 32, ENGRAM_SMALL_READ_ROWS = DS4_ENGRAM_COLS };
 
 typedef struct {
     const ds4_engram_table *table;
     const engram_request *request;
     float *out;
     size_t count, readers;
-    int error[ENGRAM_READERS];
+    int error[ENGRAM_READERS_MAX];
 } engram_batch;
+
+static long engram_read_count_env(const char *name, long fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || v < 1 || v > ENGRAM_READERS_MAX) return fallback;
+    return v;
+}
+
+static size_t engram_readers_for(size_t count) {
+    static long small = -1, large = -1;
+    if (small < 0) {
+        small = engram_read_count_env("DS4_ENGRAM_READERS_SMALL", ENGRAM_READERS_SMALL);
+        large = engram_read_count_env("DS4_ENGRAM_READERS_LARGE", ENGRAM_READERS_LARGE);
+    }
+    return (size_t)(count <= (size_t)ENGRAM_SMALL_READ_ROWS ? small : large);
+}
 
 static void read_batch_part(void *context, size_t part) {
     engram_batch *batch = context;
@@ -281,7 +329,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             }
         }
         if ((long)count >= concurrent_min) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = engram_readers_for(count);
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
         } else
