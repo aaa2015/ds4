@@ -14263,8 +14263,14 @@ decode_again:
              * Rewind unconditionally rather than only on engines with a
              * rollback frontier: leaving the drafts in place lets a live
              * tool-result continuation append after a token the client never
-             * saw.  DeepSeek has no frontier and invalidates its checkpoint
-             * here, which costs one rebuild on the next request. */
+             * saw.  DeepSeek has no frontier, so this invalidates its
+             * checkpoint and the next matching request rebuilds this prefix
+             * instead of reusing it; PR #1003 restores the snapshot here and
+             * removes that cost.  An invalidated checkpoint must not itself
+             * refuse the continuation -- a text-only one carries no image for
+             * the vision checks to compare, and they now answer before the
+             * checkpoint_valid gate (see ds4_session_vision_prefix_matches), so
+             * the history is replayed rather than rejected with a 409. */
             if (kept < ntok && !text_stop && !job_cancelled(j) &&
                 strcmp(finish, "error")) {
                 int pos = block_start + kept;
