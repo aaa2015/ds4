@@ -2693,6 +2693,72 @@ bad:
     return true;
 }
 
+/* Re-emit a JSON value with the separators Python's json.dumps uses by
+ * default: ", " between members and ": " after a key.
+ *
+ * Both official chat templates construct their <tools> section out of Jinja's
+ * tojson filter, which is defined in terms of json.dumps, so this -- not the
+ * client's own spacing -- is the shape the model was trained to read.  Nested
+ * objects and arrays have to be walked for the same reason: only re-spacing
+ * the outer object leaves every inner one compact. */
+static void append_json_spaced(const char **pp, buf *b) {
+    const char *p = *pp;
+    json_ws(&p);
+    if (*p == '{') {
+        p++;
+        buf_putc(b, '{');
+        json_ws(&p);
+        bool first = true;
+        while (*p && *p != '}') {
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            char *key = NULL;
+            if (!json_string(&p, &key)) break;
+            json_escape(b, key);
+            free(key);
+            json_ws(&p);
+            if (*p == ':') p++;
+            buf_puts(b, ": ");
+            json_ws(&p);
+            append_json_spaced(&p, b);
+            json_ws(&p);
+            if (*p == ',') p++;
+            json_ws(&p);
+        }
+        if (*p == '}') p++;
+        buf_putc(b, '}');
+    } else if (*p == '[') {
+        p++;
+        buf_putc(b, '[');
+        json_ws(&p);
+        bool first = true;
+        while (*p && *p != ']') {
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            append_json_spaced(&p, b);
+            json_ws(&p);
+            if (*p == ',') p++;
+            json_ws(&p);
+        }
+        if (*p == ']') p++;
+        buf_putc(b, ']');
+    } else if (*p == '"') {
+        char *str = NULL;
+        if (json_string(&p, &str)) {
+            json_escape(b, str);
+            free(str);
+        }
+    } else {
+        const char *start = p;
+        while (*p && *p != ',' && *p != '}' && *p != ']' &&
+               !isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (p > start) buf_append(b, start, (size_t)(p - start));
+    }
+    *pp = p;
+}
+
 static bool append_glm_tool_schema_json(buf *b, const char *json,
                                         bool *emitted) {
     json_args args = {0};
@@ -2718,7 +2784,10 @@ static bool append_glm_tool_schema_json(buf *b, const char *json,
         json_escape(b, arg->key);
         buf_puts(b, ": ");
         if (arg->is_string) json_escape(b, arg->value);
-        else buf_puts(b, arg->value);
+        else {
+            const char *value = arg->value;
+            append_json_spaced(&value, b);
+        }
         wrote = true;
     }
     buf_putc(b, '}');
@@ -2733,7 +2802,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         "\n# Tools\n\n"
         "You may call one or more functions to assist with the user query.\n\n"
         "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n\n");
+        "<tools>\n");
 
     const char *p = tool_schemas;
     bool any = false;
@@ -2748,7 +2817,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         }
         free(raw);
         if (emitted) {
-            buf_puts(b, "\n\n\n");
+            buf_puts(b, "\n");
             any = true;
         }
         json_ws(&p);
@@ -18074,7 +18143,7 @@ static void test_render_qwen_chat_prompt_text(void) {
     TEST_ASSERT(!strncmp(prompt, "<|im_start|>system\nReasoning effort is set to xhigh.", 52));
     TEST_ASSERT(strstr(prompt, "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
                                "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": "
-                               "{\"type\":\"object\",\"properties\":{\"command\":{}}}}}\n</tools>\n\n"
+                               "{\"type\": \"object\", \"properties\": {\"command\": {}}}}}\n</tools>\n\n"
                                "If you choose to call a function ONLY reply in the following format with NO suffix:") != NULL);
     TEST_ASSERT(strstr(prompt, "</IMPORTANT>\n\nYou are terse.<|im_end|>\n"
                                "<|im_start|>user\nHello<|im_end|>\n"
@@ -18642,8 +18711,8 @@ static void test_render_glm_chat_prompt_text(void) {
         "# Tools\n\n"
         "You may call one or more functions to assist with the user query.\n\n"
         "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n\n"
-        "{\"name\": \"bash\", \"parameters\": {\"type\":\"object\",\"properties\":{\"command\":{}}}}\n\n\n"
+        "<tools>\n"
+        "{\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {}}}}\n"
         "</tools>\n\n"
         "For each function call, output the function name and arguments within the following XML format:\n"
         "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
@@ -18728,6 +18797,33 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+/* Both official templates build their <tools> section from Jinja's tojson,
+ * i.e. json.dumps with default separators.  Nested objects and arrays are the
+ * part that silently stayed compact while the outer object was re-spaced, so
+ * cover arrays (including an empty one) and nesting explicitly. */
+static void test_tool_schema_json_uses_template_spacing(void) {
+    const char *schema =
+        "{\"name\":\"weather\",\"parameters\":{\"type\":\"object\",\"properties\":"
+        "{\"city\":{\"type\":\"string\"},\"units\":{\"enum\":[\"c\",\"f\"]}},"
+        "\"required\":[\"city\",\"units\"]},\"meta\":{\"tags\":[],\"flags\":{\"x\":true}},"
+        "\"count\":3}";
+    buf b = {0};
+    const char *p = schema;
+    append_json_spaced(&p, &b);
+    TEST_ASSERT(b.ptr != NULL);
+    TEST_ASSERT(!strcmp(b.ptr,
+        "{\"name\": \"weather\", \"parameters\": {\"type\": \"object\", "
+        "\"properties\": {\"city\": {\"type\": \"string\"}, "
+        "\"units\": {\"enum\": [\"c\", \"f\"]}}, "
+        "\"required\": [\"city\", \"units\"]}, "
+        "\"meta\": {\"tags\": [], \"flags\": {\"x\": true}}, "
+        "\"count\": 3}"));
+    /* the whole input must have been consumed */
+    json_ws(&p);
+    TEST_ASSERT(*p == '\0');
+    buf_free(&b);
 }
 
 static void test_render_glm_groups_tool_results(void) {
@@ -23050,6 +23146,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_visible_text_deepseek_tool_context();
     test_dsml_tool_visible_checkpoint_boundary();
     test_glm_tool_calls_render_matches_template();
+    test_tool_schema_json_uses_template_spacing();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
