@@ -2759,18 +2759,32 @@ static void append_json_spaced(const char **pp, buf *b) {
     *pp = p;
 }
 
-static bool append_glm_tool_schema_json(buf *b, const char *json,
-                                        bool *emitted) {
+/* Emit one tool's function object as `{...}`.
+ *
+ * drop_client_hints mirrors what the target syntax's chat template does with
+ * the OpenAI/Anthropic hints that clients attach to a tool:
+ *
+ *   GLM  -- iterates the members itself, omitting `strict` and
+ *           `defer_loading`, and hides the tool entirely when it is marked
+ *           defer_loading.
+ *   Qwen -- `{{ tool | tojson }}`, i.e. whatever the client sent, verbatim.
+ *
+ * Hence the flag rather than one behaviour: Qwen was previously being served
+ * GLM's filtering and quietly lost hints its template preserves. */
+static bool append_tool_schema_json(buf *b, const char *json, bool *emitted,
+                                    bool drop_client_hints) {
     json_args args = {0};
     *emitted = false;
     if (!json_args_parse(json, &args)) return false;
 
-    for (int i = 0; i < args.len; i++) {
-        const json_arg *arg = &args.v[i];
-        if (!strcmp(arg->key, "defer_loading") &&
-            !arg->is_string && !strcmp(arg->value, "true")) {
-            json_args_free(&args);
-            return true;
+    if (drop_client_hints) {
+        for (int i = 0; i < args.len; i++) {
+            const json_arg *arg = &args.v[i];
+            if (!strcmp(arg->key, "defer_loading") &&
+                !arg->is_string && !strcmp(arg->value, "true")) {
+                json_args_free(&args);
+                return true;
+            }
         }
     }
 
@@ -2778,8 +2792,11 @@ static bool append_glm_tool_schema_json(buf *b, const char *json,
     bool wrote = false;
     for (int i = 0; i < args.len; i++) {
         const json_arg *arg = &args.v[i];
-        if (!strcmp(arg->key, "defer_loading") ||
-            !strcmp(arg->key, "strict")) continue;
+        if (drop_client_hints &&
+            (!strcmp(arg->key, "defer_loading") ||
+             !strcmp(arg->key, "strict"))) {
+            continue;
+        }
         if (wrote) buf_puts(b, ", ");
         json_escape(b, arg->key);
         buf_puts(b, ": ");
@@ -2811,7 +2828,7 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         char *raw = NULL;
         if (!json_raw_value(&p, &raw)) break;
         bool emitted = false;
-        if (!append_glm_tool_schema_json(b, raw, &emitted)) {
+        if (!append_tool_schema_json(b, raw, &emitted, true)) {
             buf_puts(b, raw);
             emitted = true;
         }
@@ -3530,7 +3547,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         if (!json_raw_value(&p, &raw)) break;
         buf inner = {0};
         bool emitted = false;
-        if (!append_glm_tool_schema_json(&inner, raw, &emitted)) {
+        if (!append_tool_schema_json(&inner, raw, &emitted, false)) {
             buf_puts(&inner, raw);
             emitted = true;
         }
@@ -18143,7 +18160,8 @@ static void test_render_qwen_chat_prompt_text(void) {
     TEST_ASSERT(!strncmp(prompt, "<|im_start|>system\nReasoning effort is set to xhigh.", 52));
     TEST_ASSERT(strstr(prompt, "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
                                "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": "
-                               "{\"type\": \"object\", \"properties\": {\"command\": {}}}}}\n</tools>\n\n"
+                               "{\"type\": \"object\", \"properties\": {\"command\": {}}}, "
+                               "\"strict\": true}}\n</tools>\n\n"
                                "If you choose to call a function ONLY reply in the following format with NO suffix:") != NULL);
     TEST_ASSERT(strstr(prompt, "</IMPORTANT>\n\nYou are terse.<|im_end|>\n"
                                "<|im_start|>user\nHello<|im_end|>\n"
@@ -18824,6 +18842,56 @@ static void test_tool_schema_json_uses_template_spacing(void) {
     json_ws(&p);
     TEST_ASSERT(*p == '\0');
     buf_free(&b);
+}
+
+/* The two templates disagree about client-side hints, so the shared emitter
+ * is driven by a flag.  Cover both sides, including the hiding rule that only
+ * GLM applies. */
+static void test_tool_schema_hints_follow_the_template(void) {
+    const char *schema =
+        "{\"name\":\"bash\",\"strict\":true,\"defer_loading\":false,"
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{}}}}";
+    const char *deferred =
+        "{\"name\":\"later\",\"defer_loading\":true,"
+        "\"parameters\":{\"type\":\"object\"}}";
+    bool emitted = false;
+
+    /* GLM drops both hints. */
+    buf glm = {0};
+    TEST_ASSERT(append_tool_schema_json(&glm, schema, &emitted, true));
+    TEST_ASSERT(emitted);
+    TEST_ASSERT(glm.ptr != NULL);
+    TEST_ASSERT(!strcmp(glm.ptr,
+        "{\"name\": \"bash\", \"parameters\": {\"type\": \"object\", "
+        "\"properties\": {\"command\": {}}}}"));
+    buf_free(&glm);
+
+    /* GLM hides a tool marked defer_loading. */
+    buf hidden = {0};
+    TEST_ASSERT(append_tool_schema_json(&hidden, deferred, &emitted, true));
+    TEST_ASSERT(!emitted);
+    buf_free(&hidden);
+
+    /* Qwen keeps every member the client sent. */
+    buf qwen = {0};
+    TEST_ASSERT(append_tool_schema_json(&qwen, schema, &emitted, false));
+    TEST_ASSERT(emitted);
+    TEST_ASSERT(qwen.ptr != NULL);
+    TEST_ASSERT(!strcmp(qwen.ptr,
+        "{\"name\": \"bash\", \"strict\": true, \"defer_loading\": false, "
+        "\"parameters\": {\"type\": \"object\", \"properties\": "
+        "{\"command\": {}}}}"));
+    buf_free(&qwen);
+
+    /* ...including tools that GLM would have hidden. */
+    buf kept = {0};
+    TEST_ASSERT(append_tool_schema_json(&kept, deferred, &emitted, false));
+    TEST_ASSERT(emitted);
+    TEST_ASSERT(kept.ptr != NULL);
+    TEST_ASSERT(!strcmp(kept.ptr,
+        "{\"name\": \"later\", \"defer_loading\": true, "
+        "\"parameters\": {\"type\": \"object\"}}"));
+    buf_free(&kept);
 }
 
 static void test_render_glm_groups_tool_results(void) {
@@ -23147,6 +23215,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_visible_checkpoint_boundary();
     test_glm_tool_calls_render_matches_template();
     test_tool_schema_json_uses_template_spacing();
+    test_tool_schema_hints_follow_the_template();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
