@@ -2990,7 +2990,11 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         buf_puts(b, calls->raw_tool_text);
         return;
     }
-    buf_putc(b, '\n');
+    /* GLM's chat template emits the block inline, with no newline before or
+     * after it (checked against tokenizer.chat_template in the GGUF and
+     * against the bytes the model itself samples).  Wrapping it in newlines
+     * made a replayed history differ from the sampled bytes, so a KV visible
+     * key built from the live transcript could never match a client replay. */
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
@@ -3004,7 +3008,6 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         }
         buf_puts(b, "</tool_call>");
     }
-    buf_putc(b, '\n');
 }
 
 /* Parameter values render as the template does: strings verbatim, other
@@ -18709,12 +18712,15 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
+    /* GLM's chat template renders the tool block inline: no newline before
+     * <tool_call> and none after </tool_call> (see
+     * test_glm_tool_calls_render_matches_template). */
     const char *expected =
         "[gMASK]<sop><|system|>Reasoning Effort: High"
-        "<|user|>first<|assistant|><think>tool reasoning</think>\n"
+        "<|user|>first<|assistant|><think>tool reasoning</think>"
         "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value>"
         "</tool_call><tool_call>bash<arg_key>command</arg_key>"
-        "<arg_value>ls</arg_value></tool_call>\n"
+        "<arg_value>ls</arg_value></tool_call>"
         "<|observation|><tool_response>/tmp</tool_response>"
         "<|assistant|><think>";
     TEST_ASSERT(!strcmp(prompt, expected));
@@ -22225,6 +22231,57 @@ static void test_thinking_visible_text_deepseek_tool_context(void) {
  * sampled tool-calls end marker; the next request echoes the turn without
  * reasoning as "<think></think>{content}{raw DSML}<eos>".  The visible key
  * must be a byte prefix of that, ending exactly at the raw DSML block. */
+/* GLM's chat template renders the tool block inline: no newline before
+ * <tool_call> and none after </tool_call>.  The canonical render must match
+ * both the template and the bytes the model samples.  A visible-key KV
+ * checkpoint built during a live tool turn is keyed by the sampled bytes, so a
+ * mismatch here makes the checkpoint unmatchable by a client replay. */
+static void test_glm_tool_calls_render_matches_template(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+                        "\"parameters\":{\"type\":\"object\",\"properties\":"
+                        "{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}]";
+    const char *raw_block =
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("What is the weather in Paris?");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("");
+    tool_call call = {0};
+    call.name = xstrdup("get_weather");
+    call.arguments = xstrdup("{\"city\":\"Paris\"}");
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("18C, light rain.");
+    chat_msgs_push(&msgs, tool);
+
+    char *canonical = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, tools, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(canonical != NULL);
+    TEST_ASSERT(strstr(canonical, raw_block) != NULL);
+    TEST_ASSERT(strstr(canonical, "</think><tool_call>") != NULL);
+    TEST_ASSERT(strstr(canonical, "</tool_call><|observation|>") != NULL);
+    TEST_ASSERT(strstr(canonical, "</think>\n<tool_call>") == NULL);
+    TEST_ASSERT(strstr(canonical, "</tool_call>\n") == NULL);
+
+    /* The live path splices the sampled block; both renders must be identical,
+     * which is what lets a restart replay match the visible key. */
+    msgs.v[1].calls.raw_tool_text = xstrdup(raw_block);
+    char *raw = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, tools, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(raw != NULL);
+    TEST_ASSERT(!strcmp(raw, canonical));
+
+    free(raw);
+    free(canonical);
+    chat_msgs_free(&msgs);
+}
+
 static void test_dsml_tool_visible_checkpoint_boundary(void) {
     const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"bash\","
                         "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
@@ -22992,6 +23049,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_visible_text_deepseek_tool_context();
     test_dsml_tool_visible_checkpoint_boundary();
+    test_glm_tool_calls_render_matches_template();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
