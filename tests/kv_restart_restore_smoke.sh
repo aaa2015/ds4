@@ -25,6 +25,9 @@ Environment:
   DS4_TEST_MODEL=ds4flash.gguf
   DS4_KV_RESTORE_PORT=8199
   DS4_KV_RESTORE_CTX=32768
+  DS4_KV_RESTORE_PREFILL_CHUNK=1024 set empty to omit --prefill-chunk, needed
+                                    for syntaxes that reject it (GLM selects its
+                                    own graph prefill chunks)
   DS4_KV_RESTORE_EXTRA_ARGS=""      (extra ds4-server args, e.g. "--gpu-devices 0")
   DS4_KV_RESTORE_KEEP=1             keep the temp dir (logs, kv files)
 USAGE
@@ -36,6 +39,9 @@ model=${1:-${DS4_TEST_MODEL:-ds4flash.gguf}}
 port=${DS4_KV_RESTORE_PORT:-8199}
 ctx=${DS4_KV_RESTORE_CTX:-32768}
 extra=${DS4_KV_RESTORE_EXTRA_ARGS:-}
+# GLM 5.x rejects --prefill-chunk, so let callers omit it for those models.
+chunk=${DS4_KV_RESTORE_PREFILL_CHUNK-1024}
+if [ -n "$chunk" ]; then chunk_arg="--prefill-chunk $chunk"; else chunk_arg=""; fi
 here=$(cd "$(dirname "$0")" && pwd)
 client="$here/kv_restart_restore_client.py"
 
@@ -83,7 +89,7 @@ start_server() {
     log=$1
     # shellcheck disable=SC2086
     DS4_LOCK_FILE="$tmpdir/ds4.lock" "$bin" -m "$model" -c "$ctx" --port "$port" \
-        --prefill-chunk 1024 --kv-disk-dir "$tmpdir/kv" --kv-disk-space-mb 4096 \
+        $chunk_arg --kv-disk-dir "$tmpdir/kv" --kv-disk-space-mb 4096 \
         $extra >"$log" 2>&1 &
     server_pid=$!
     i=0
