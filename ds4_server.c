@@ -1920,7 +1920,10 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         if (!json_raw_value(p, &raw)) goto bad;
         char *function = openai_function_schema_from_tool(raw);
         if (function) {
-            append_raw_json_line(&schemas, function);
+            /* Keep the tool object as the client sent it; renderers project
+             * the function out of it.  The orders table still works on the
+             * unwrapped function, which is all it looks at. */
+            append_raw_json_line(&schemas, raw);
             tool_schema_orders_add_json(orders, function);
         } else if (!append_responses_namespace_tool_schemas(&schemas, orders, raw)) {
             char *special = responses_special_schema_from_tool(raw);
@@ -2569,6 +2572,51 @@ bad:
     return false;
 }
 
+/* View of the function a client tool wraps: the value of its "function"
+ * member when it has one, otherwise the whole value.  Both chat templates draw
+ * the same line -- GLM's unwraps `function` before rendering, Qwen's renders
+ * the tool as it arrived.  *end always receives the end of the view. */
+static const char *tool_function_view(const char *raw, const char **end) {
+    const char *p = raw;
+    json_ws(&p);
+    const char *whole_end = p;
+    if (!json_skip_value(&whole_end)) {
+        *end = p + strlen(p);
+        return raw;
+    }
+    if (*p == '{') {
+        const char *q = p + 1;
+        json_ws(&q);
+        while (*q && *q != '}') {
+            char *key = NULL;
+            if (!json_string(&q, &key)) break;
+            json_ws(&q);
+            if (*q != ':') {
+                free(key);
+                break;
+            }
+            q++;
+            if (!strcmp(key, "function")) {
+                free(key);
+                json_ws(&q);
+                const char *value = q;
+                if (json_skip_value(&q)) {
+                    *end = q;
+                    return value;
+                }
+                break;
+            }
+            free(key);
+            if (!json_skip_value(&q)) break;
+            json_ws(&q);
+            if (*q == ',') q++;
+            json_ws(&q);
+        }
+    }
+    *end = whole_end;
+    return raw;
+}
+
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
     if (v41) buf_puts(b,
@@ -2603,7 +2651,26 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
         "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
-    buf_puts(b, tool_schemas);
+    const char *dp = tool_schemas;
+    bool first = true;
+    json_ws(&dp);
+    while (*dp) {
+        char *raw = NULL;
+        if (!json_raw_value(&dp, &raw)) {
+            /* Defensive: if the store is not the parsed shape we wrote, emit
+             * the remainder untouched rather than silently dropping tools. */
+            if (!first) buf_putc(b, '\n');
+            buf_puts(b, dp);
+            break;
+        }
+        const char *end = NULL;
+        const char *view = tool_function_view(raw, &end);
+        if (!first) buf_putc(b, '\n');
+        first = false;
+        buf_append(b, view, (size_t)(end - view));
+        free(raw);
+        json_ws(&dp);
+    }
     buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
                 "Use the exact parameter names from the schemas.");
 }
@@ -2827,11 +2894,15 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
     while (*p) {
         char *raw = NULL;
         if (!json_raw_value(&p, &raw)) break;
+        const char *end = NULL;
+        const char *view = tool_function_view(raw, &end);
+        char *function = xstrndup(view, (size_t)(end - view));
         bool emitted = false;
-        if (!append_tool_schema_json(b, raw, &emitted, true)) {
-            buf_puts(b, raw);
+        if (!append_tool_schema_json(b, function, &emitted, true)) {
+            buf_puts(b, function);
             emitted = true;
         }
+        free(function);
         free(raw);
         if (emitted) {
             buf_puts(b, "\n");
@@ -3545,18 +3616,13 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
     while (*p) {
         char *raw = NULL;
         if (!json_raw_value(&p, &raw)) break;
-        buf inner = {0};
-        bool emitted = false;
-        if (!append_tool_schema_json(&inner, raw, &emitted, false)) {
-            buf_puts(&inner, raw);
-            emitted = true;
-        }
-        if (emitted) {
-            buf_puts(b, "\n{\"type\": \"function\", \"function\": ");
-            buf_puts(b, inner.ptr ? inner.ptr : "{}");
-            buf_putc(b, '}');
-        }
-        buf_free(&inner);
+        /* Qwen renders `{{ tool | tojson }}`: the whole tool object, re-emitted
+         * with json.dumps' separators.  Do not rebuild a wrapper here -- that
+         * would drop any other member and impose an order the client did not
+         * use. */
+        buf_puts(b, "\n");
+        const char *rp = raw;
+        append_json_spaced(&rp, b);
         free(raw);
         json_ws(&p);
     }
@@ -18152,8 +18218,8 @@ static void test_render_qwen_chat_prompt_text(void) {
 
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{}}},\"strict\":true}";
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{}}},\"strict\":true}}";
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
@@ -18717,9 +18783,10 @@ static void test_render_glm_chat_prompt_text(void) {
 
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
-        "{\"name\":\"hidden\",\"defer_loading\":true,\"parameters\":{}}\n"
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{}}},\"strict\":true}";
+        "{\"type\":\"function\",\"function\":{\"name\":\"hidden\","
+        "\"defer_loading\":true,\"parameters\":{}}}\n"
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{}}},\"strict\":true}}";
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
 
@@ -19491,8 +19558,9 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{},\"description\":{},\"timeout\":{}}}}";
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{},\"description\":{},"
+        "\"timeout\":{}}}}}";
 
     chat_msgs prefix_msgs = {0};
     chat_msg user = {0};
@@ -19564,8 +19632,8 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
 static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{},\"description\":{}}}}";
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{},\"description\":{}}}}}";
 
     chat_msgs prefix_msgs = {0};
     chat_msg user = {0};
@@ -19643,8 +19711,8 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
         "{\"name\":\"edit\",\"parameters\":{\"type\":\"object\",\"properties\":{"
         "\"path\":{},\"edits\":{}}}}");
     const char *tool_schemas =
-        "{\"name\":\"edit\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"path\":{},\"edits\":{}}}}";
+        "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"path\":{},\"edits\":{}}}}}";
 
     chat_msgs prefix_msgs = {0};
     chat_msg user = {0};
@@ -22647,7 +22715,8 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
      * The toolless thinking live binding should NOT fire (has_tools gate),
      * and the tool-call replay path handles it.  Verify the template
      * preserves reasoning when tool_context is true. */
-    const char *tool_schemas = "{\"name\":\"bash\"}";
+    const char *tool_schemas =
+        "{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}";
 
     chat_msgs msgs = {0};
     chat_msg u = {0};
