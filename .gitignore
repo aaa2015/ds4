@@ -22,8 +22,6 @@
 /tests/test_gpu_xdev
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
-/tests/test_ane_ffn
-/tests/test_ane_mtp
 /tests/cuda_long_context_smoke
 /tests/test_layer_pack
 /tests/test_metal_session_batch

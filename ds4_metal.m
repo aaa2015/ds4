@@ -25,7 +25,6 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
-#include "ds4_ane.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -6895,7 +6894,6 @@ int ds4_gpu_init(void) {
         ds4_gpu_timeline_probe(g_device);
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
-        ds4_ane_init();
 
         g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
         if (!g_queue) {
@@ -9636,7 +9634,6 @@ static int g_parallel_ffn_mode; /* 2: gate/up + down */
 static int g_parallel_ffn_stage;
 static BOOL g_parallel_q8_pending;
 static BOOL g_parallel_q8_encoded;
-static BOOL g_parallel_ane_active;
 /* GPU-decided shared-expert lane split (see ds4_shared_split_range in
  * metal/dense.metal): the split kernels read the selected expert ids and
  * take a complementary lane range per rank sized to balance the bytes each
@@ -9669,7 +9666,6 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
     g_batch_encoder_concurrent = NO;
     g_parallel_q8_pending = NO;
     g_parallel_q8_encoded = NO;
-    g_parallel_ane_active = NO;
     g_parallel_ffn_mode = 0;
     g_parallel_ffn_stage = 0;
 
@@ -9707,10 +9703,6 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
 }
 
 void ds4_gpu_parallel_ffn_abort(void) {
-    if (g_parallel_ane_active) {
-        ds4_ane_shared_ffn_abort();
-        g_parallel_ane_active = NO;
-    }
     ds4_gpu_parallel_ffn_reset_state(YES);
 }
 
@@ -9863,23 +9855,6 @@ int ds4_gpu_parallel_ffn_start(
         uint32_t              shared_dim,
         const ds4_gpu_tensor *x,
         float                 clamp) {
-    if (ds4_ane_is_available()) {
-        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
-        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(shared_out);
-        if (xbuf && outbuf) {
-            const float *x_ptr = (const float *)((const char *)[xbuf contents] + ds4_gpu_tensor_offset(x));
-            float *out_ptr = (float *)((char *)[outbuf contents] + ds4_gpu_tensor_offset(shared_out));
-            if (ds4_ane_shared_ffn_start(model_map, model_size, gate_offset, up_offset, down_offset,
-                                         model_dim, shared_dim, x_ptr, out_ptr, clamp)) {
-                g_parallel_ane_active = YES;
-                g_parallel_q8_pending = YES;
-                g_parallel_q8_encoded = YES;
-                g_parallel_ffn_mode = 2;
-                g_parallel_ffn_stage = 2;
-                return 1;
-            }
-        }
-    }
     return ds4_gpu_parallel_ffn_start_range(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
@@ -10066,7 +10041,6 @@ static void ds4_gpu_encode_parallel_q8_down(
 static int ds4_gpu_parallel_q8_matvec_encode_pending(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        routed_mid) {
-    if (g_parallel_ane_active) return 1;
     if (!g_parallel_q8_pending || g_parallel_ffn_mode != 2 ||
         g_parallel_ffn_stage != 0 || !g_batch_encoder_concurrent ||
         !g_batch_cb || cb != g_batch_cb) {
@@ -10156,7 +10130,6 @@ static int ds4_gpu_parallel_q8_matvec_encode_pending(
 
 static int ds4_gpu_parallel_ffn_encode_second_stage(
         id<MTLCommandBuffer> cb) {
-    if (g_parallel_ane_active) return 1;
     if (!g_parallel_q8_pending || g_parallel_ffn_mode != 2 ||
         g_parallel_ffn_stage != 1 || !g_batch_encoder_concurrent ||
         !g_batch_cb || cb != g_batch_cb) {
@@ -10174,12 +10147,6 @@ static int ds4_gpu_parallel_ffn_encode_second_stage(
 }
 
 int ds4_gpu_parallel_ffn_finish(void) {
-    if (g_parallel_ane_active) {
-        int ok = ds4_ane_shared_ffn_finish();
-        g_parallel_ane_active = NO;
-        ds4_gpu_parallel_ffn_reset_state(NO);
-        return ok;
-    }
     const int completed =
         g_parallel_q8_pending && g_parallel_q8_encoded &&
         g_parallel_ffn_stage == 2 && g_batch_encoder_concurrent;
