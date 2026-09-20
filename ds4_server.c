@@ -11911,13 +11911,25 @@ typedef struct {
  * there and the REUSE_MEMORY_REWIND tier would be unreachable from a unit test.
  * -1 keeps the real predicate: production never compiles this override. */
 #ifdef DS4_SERVER_TEST
+/* Separate overrides for the two gates, so a test can prove which one rejects:
+ * the engine-level predicate (can this engine rewind at all?) and the
+ * session-level one (can it rewind to THIS position?). */
 static int g_test_can_rewind_override = -1;
+static int g_test_can_rewind_session_override = -1;
 static bool probe_can_rewind(server *s) {
     if (g_test_can_rewind_override >= 0) return g_test_can_rewind_override != 0;
     return ds4_engine_can_rewind(s->engine);
 }
+static bool probe_can_rewind_session(server *s, server_slot *slot, int pos) {
+    if (g_test_can_rewind_session_override >= 0)
+        return g_test_can_rewind_session_override != 0;
+    if (g_test_can_rewind_override >= 0) return g_test_can_rewind_override != 0;
+    return ds4_session_can_rewind(slot->session, pos);
+}
 #else
 #define probe_can_rewind(s) ds4_engine_can_rewind((s)->engine)
+#define probe_can_rewind_session(s, slot, pos) \
+    ds4_session_can_rewind((slot)->session, (pos))
 #endif
 
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
@@ -12012,7 +12024,15 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int rewind_to = live_prefix_rewind_target(
         probe_can_rewind(s), live_pos, req->prompt.len, common,
         &rewind_full_prefix);
-    if (rewind_to >= 0 && token_image_prefix) {
+    /* Ask the session whether THIS rewind is actually rollable back before
+     * advertising the tier.  ds4_session_can_rewind() encodes each engine's
+     * window (GLM 5.3: at most two tokens; Metal DSpark: inside the saved
+     * frontier), and ds4_session_rewind() is destructive: it truncates the
+     * checkpoint and only then reports failure, leaving nothing reusable.
+     * Checking here keeps routing and execution in agreement -- a slot this
+     * tier cannot serve must not be scored as reusable either. */
+    if (rewind_to >= 0 && token_image_prefix &&
+        probe_can_rewind_session(s, slot, rewind_to)) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
         pr.full_prefix = rewind_full_prefix;
@@ -21945,6 +21965,7 @@ static void test_slot_probe_rewind_tier(void) {
      *    first 3 and then diverges.  The tier truncates to those 3. */
     {
         g_test_can_rewind_override = 1;
+        g_test_can_rewind_session_override = 1;
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
         job j = {0};
@@ -21964,6 +21985,7 @@ static void test_slot_probe_rewind_tier(void) {
      *    report full_prefix. */
     {
         g_test_can_rewind_override = 1;
+        g_test_can_rewind_session_override = 1;
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
         job j = {0};
@@ -21978,10 +22000,11 @@ static void test_slot_probe_rewind_tier(void) {
         request_free(&j.req);
     }
 
-    /* 3. Gate closed: the same partial-prefix request must not take the tier,
-     *    and must not fall into a later one either. */
+    /* 3. Engine gate closed: the same partial-prefix request must not take the
+     *    tier, and must not fall into a later one either. */
     {
         g_test_can_rewind_override = 0;
+        g_test_can_rewind_session_override = -1;
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
         job j = {0};
@@ -21996,9 +22019,11 @@ static void test_slot_probe_rewind_tier(void) {
     }
 
     /* 4. Seam default: no override, no engine -> the real predicate is false and
-     *    the tier stays closed.  Guards against the override leaking out. */
+     *    the tier stays closed.  Guards against an override leaking into another
+     *    test. */
     {
         g_test_can_rewind_override = -1;
+        g_test_can_rewind_session_override = -1;
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
         job j = {0};
@@ -22012,9 +22037,33 @@ static void test_slot_probe_rewind_tier(void) {
         request_free(&j.req);
     }
 
-    /* 5. Nothing in common: no usable frontier, so no rewind. */
+    /* 5. Engine gate open but the session cannot roll back to THIS position.
+     *    This is GLM 5.3 in the field: ds4_session_glm_mtp_rewind() only accepts
+     *    a target within two tokens of its rollback point, so a partial-prefix
+     *    rewind to a distant `common` is rollback-impossible.  The tier must not
+     *    be advertised: ds4_session_rewind() would truncate the checkpoint and
+     *    then report failure, leaving nothing reusable and logging a rebuild. */
     {
         g_test_can_rewind_override = 1;
+        g_test_can_rewind_session_override = 0;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        const int pt[5] = {1, 2, 3, 9, 10};
+        for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, pt[i]);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+        g_test_can_rewind_session_override = -1;
+    }
+
+    /* 6. Nothing in common: no usable frontier, so no rewind. */
+    {
+        g_test_can_rewind_override = 1;
+        g_test_can_rewind_session_override = 1;
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
         job j = {0};
