@@ -11905,6 +11905,21 @@ typedef struct {
     bool full_prefix;   /* REUSE_MEMORY_REWIND: the whole prompt was cached */
 } slot_reuse;
 
+/* Test seam for the rewind gate.  The CPU-only test build cannot construct a
+ * GLM or Metal DSpark engine (DS4_NO_GPU drops the DSpark branch, and the shape
+ * defaults to DeepSeek V4 Flash), so ds4_engine_can_rewind() is always false
+ * there and the REUSE_MEMORY_REWIND tier would be unreachable from a unit test.
+ * -1 keeps the real predicate: production never compiles this override. */
+#ifdef DS4_SERVER_TEST
+static int g_test_can_rewind_override = -1;
+static bool probe_can_rewind(server *s) {
+    if (g_test_can_rewind_override >= 0) return g_test_can_rewind_override != 0;
+    return ds4_engine_can_rewind(s->engine);
+}
+#else
+#define probe_can_rewind(s) ds4_engine_can_rewind((s)->engine)
+#endif
+
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
     slot_reuse pr = { REUSE_NONE, 0, 0, 0, false };
@@ -11995,7 +12010,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * probe gave us; only the operand changes. */
     bool rewind_full_prefix = false;
     const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_can_rewind(s->engine), live_pos, req->prompt.len, common,
+        probe_can_rewind(s), live_pos, req->prompt.len, common,
         &rewind_full_prefix);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
@@ -21912,6 +21927,109 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 165755, 4977, 4973, NULL) == 4973);
 }
 
+/* The rewind TIER, not just the decision function: a request whose prompt shares
+ * only a prefix with the live state must come back as REUSE_MEMORY_REWIND, the
+ * reusable count must be the common prefix, and a fully resident prompt must set
+ * full_prefix so the caller hands the last prompt token back to the sampler.
+ *
+ * The gate seam exists because this build cannot construct a GLM or Metal DSpark
+ * engine, so ds4_engine_can_rewind() is always false here.  Case <<4>> pins the
+ * seam's default (real predicate, no engine) so the override cannot leak into
+ * another test unnoticed. */
+static void test_slot_probe_rewind_tier(void) {
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+
+    /* 1. Partial prefix: the live state holds 10 tokens, the request shares the
+     *    first 3 and then diverges.  The tier truncates to those 3. */
+    {
+        g_test_can_rewind_override = 1;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        const int pt[5] = {1, 2, 3, 9, 10};
+        for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, pt[i]);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_REWIND);
+        TEST_ASSERT(pr.reuse_tokens == 3);
+        TEST_ASSERT(!pr.full_prefix);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 2. Fully resident prompt (8 of the 10 live tokens): rewind one short and
+     *    report full_prefix. */
+    {
+        g_test_can_rewind_override = 1;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        for (int i = 0; i < 8; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_REWIND);
+        TEST_ASSERT(pr.reuse_tokens == 7);
+        TEST_ASSERT(pr.full_prefix);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 3. Gate closed: the same partial-prefix request must not take the tier,
+     *    and must not fall into a later one either. */
+    {
+        g_test_can_rewind_override = 0;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        const int pt[5] = {1, 2, 3, 9, 10};
+        for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, pt[i]);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 4. Seam default: no override, no engine -> the real predicate is false and
+     *    the tier stays closed.  Guards against the override leaking out. */
+    {
+        g_test_can_rewind_override = -1;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        const int pt[5] = {1, 2, 3, 9, 10};
+        for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, pt[i]);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 5. Nothing in common: no usable frontier, so no rewind. */
+    {
+        g_test_can_rewind_override = 1;
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        ds4_tokens_push(&j.req.prompt, 99);
+        ds4_tokens_push(&j.req.prompt, 98);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+        g_test_can_rewind_override = -1;
+    }
+}
+
 static void test_server_builtin_model_ids(void) {
     server srv = {0};
     size_t count = 0;
@@ -24237,6 +24355,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_slot_probe_rewind_tier();
     test_server_builtin_model_ids();
     test_model_catalog_matches_loaded_variant();
     test_send_models_json_shape();
