@@ -232,6 +232,13 @@ static int request_order(const void *a, const void *b) {
 #endif
 
 enum { ENGRAM_READERS_MAX = 32, ENGRAM_SMALL_READ_ROWS = DS4_ENGRAM_COLS };
+enum { ENGRAM_READERS = 16 };
+#ifdef __APPLE__
+enum { ENGRAM_PARALLEL_MIN_ROWS = 8 };
+#else
+/* Unlike dispatch's shared pool, this path creates threads for each batch. */
+enum { ENGRAM_PARALLEL_MIN_ROWS = 256 };
+#endif
 
 typedef struct {
     const ds4_engram_table *table;
@@ -348,8 +355,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
 #else
-            pthread_t threads[ENGRAM_READERS - 1];
-            engram_reader readers[ENGRAM_READERS - 1];
+            /* batch.readers is chosen by read size and may exceed ENGRAM_READERS;
+         * size by the ceiling so a large DS4_ENGRAM_READERS_LARGE cannot overrun. */
+        pthread_t threads[ENGRAM_READERS_MAX - 1];
+            engram_reader readers[ENGRAM_READERS_MAX - 1];
             size_t started = 0;
             for (size_t part = 1; part < batch.readers; part++) {
                 readers[started] = (engram_reader){&batch, part};

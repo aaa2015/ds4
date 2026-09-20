@@ -335,6 +335,16 @@ or backend fallback selection changes.
   the shared expert, but still runs attention, routed experts, shared down, and
   the output head per session. Treat flat aggregate scaling as unfinished
   implementation work, not evidence that Metal cannot benefit from batching.
+- Before physical Metal TP, check both hosts against the link and memory setup
+  in [the distributed guide](docs/DISTRIBUTED.md). Reboots can reset
+  member-interface IPv4 aliases and `iogpu.wired_limit_mb`. An active port is not
+  enough, and a shard above the effective GPU residency limit may page heavily.
+  Preserve OS headroom; do not bypass the memory guard to make a test fit.
+  Match explicit `--prefill-chunk` overrides on both ranks. A different chunk
+  schedule can fail during prefill synchronization rather than at the handshake.
+  The batch oracle needs extra sessions for mixed prefill and serial controls.
+  Use an admitted context for its short-prompt checks, then test long contexts
+  separately rather than skipping the mixed checks.
 - On `mac-m5max-it` and `mac-m5max-us`, run the same oracle in physical TP mode
   over explicit `tcp` and `rdma` transports. Set `DS4_TEST_TP_MODE=leader` on
   the leader and `DS4_TEST_TP_MODE=worker DS4_TEST_TP_LEADER_HOST=HOST` on the
@@ -1519,8 +1529,12 @@ the long sparse-boundary tests; neither substitutes for the other.
   prompts and row order, checks complete target logits exactly, tests invalid
   batches without advancing state, and resumes after a mixed prefill/decode call.
   Isolation does not establish equivalence to serial inference: separately run
-  `score_official --session-batch N` on the short and long manifests. Measure
-  aggregate throughput without Metal validation, including two-session cases.
+  `score_official --session-batch N` on the short and long manifests. Test
+  physical Metal TP native batches with at least three rows: two rows use
+  ordered execution by design. Confirm dispatch in the log instead of assuming
+  that `--session-batch` selects the native path.
+  Measure aggregate throughput without Metal validation, including two-session
+  cases.
   Require the `native_ds41=1` trace for admitted native shapes, including mixed
   batches with nonzero `prefill_rows`; a passing ordered fallback is not evidence
   for the native path. Image-bearing sessions currently use that fallback.
@@ -1960,6 +1974,28 @@ paired comparisons, also with decode graphs disabled. Separately run the
   record different-schedule probability differences separately. Nearly tied
   experts can amplify normal rounding, so a max-logit difference alone does
   not establish a state bug or a quality regression.
+- For Metal native batching, run `tests/test_metal_session_batch` with
+  `DS4_TEST_BATCH_ISOLATION=1` at two, four and eight sessions, including a
+  sparse prefix. Reordered rows and changed companions must leave the target's
+  complete logits identical. Separately score both official manifests with
+  `--session-batch 1`, `4` and `8`; compare paired losses and API agreement.
+  The scalar and batched reductions need not be bit-identical. Investigate
+  greedy mismatches with their logit margins, not by loosening kernel tests.
+  Run `tests/test_qwen4_kernels` under Metal validation and the real-model
+  `tests/test_qwen4_ngram_state` for mixed ordinary/MTP cycles, failed batch
+  reads, exact recovery and the final context slot.
+- Start a four-slot Qwen Metal server with and without `--mtp`. Check concurrent
+  tool calls, prefix reuse, cancellation, stop strings and one/two-token output
+  limits. Repeat with `--mtp-exact-sampling`, mixing temperature-zero and
+  sampled requests. Only the former may use greedy speculative acceptance.
+  Compare seeded sampled replies in exact mode; default greedy MTP changes
+  random draws with draft scheduling, so equal seeds need not give equal text.
+  Benchmark ordinary and speculative batches on both prose and code, using
+  `speed-bench/session_concurrency_bench`; record aggregate and per-session
+  throughput. Keep n-grams on disk and monitor memory during arena growth,
+  session destruction/recreation and engine cleanup.
+  Run `python3 -m unittest discover -s tests -p test_serve_concurrency_bench.py`
+  so truncated/error streams cannot silently enter the throughput results.
 - Run `tests/test_server_story.py` with at least 49K server context: all sixteen
   story facts, the correction turn and cached-prefix reuse must pass. Also
   run `tests/test_agent_vision.py` with a long archive and
