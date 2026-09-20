@@ -72031,13 +72031,23 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 
 bool ds4_engine_can_rewind(ds4_engine *e) {
     if (!e) return false;
+    /* The question here is narrow: does ds4_session_rewind() roll the engine
+     * back while keeping the checkpoint, or does it clear checkpoint_valid and
+     * force the very rebuild this helper exists to avoid?  Keep this in step
+     * with the branches in ds4_session_rewind().
+     *
+     * GLM rolls back through its own frontier.  Qwen3.8 restores a verify
+     * snapshot when one matches the position and otherwise resets the graph
+     * and replays the kept transcript -- either way state_ok is set, so the
+     * checkpoint survives and the rewind is exactly the case this gate is meant
+     * to admit.  DeepSeek's DSpark compressors cannot be rolled back by
+     * truncating their row counts and keep no frontier, so only the Metal
+     * snapshot path below qualifies. */
     if (ds4_engine_is_glm_dsa(e) || ds4_engine_is_glm53(e)) return true;
 #ifndef DS4_NO_GPU
-    /* Metal DSpark restores snapshots from ds4_session_rewind(), so DeepSeek
-     * rewind requests can take the fast path. */
     if (e->backend == DS4_BACKEND_METAL && e->dspark) return true;
 #endif
-    return false;
+    return ds4_engine_is_qwen4(e);
 }
 
 bool ds4_engine_is_qwen4(ds4_engine *e) {
