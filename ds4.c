@@ -137,6 +137,9 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#if defined(__APPLE__)
+#include "ds4_ane.h"
+#endif
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -36592,6 +36595,51 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         int                   *top_id) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_ane_mtp_is_available() && base_weights->output && base_weights->output->type == DS4_TENSOR_Q8_0) {
+        const float *prev_ptr = (const float *)ds4_gpu_tensor_contents(prev_hc);
+        float *out_ptr = (float *)ds4_gpu_tensor_contents(out_hc);
+        if (prev_ptr && out_ptr) {
+            int ane_top = -1;
+            uint64_t ffn_gate_off = mtp->block.ffn_gate_shexp ? mtp->block.ffn_gate_shexp->abs_offset : 0;
+            uint64_t ffn_up_off   = mtp->block.ffn_up_shexp ? mtp->block.ffn_up_shexp->abs_offset : 0;
+            uint64_t ffn_down_off = mtp->block.ffn_down_shexp ? mtp->block.ffn_down_shexp->abs_offset : 0;
+            uint32_t shared_dim = mtp->block.ffn_gate_shexp ? (uint32_t)mtp->block.ffn_gate_shexp->dim[1] : (uint32_t)DS4_N_FF_EXP;
+
+            if (ds4_ane_eval_mtp_draft(
+                    token,
+                    pos,
+                    base_model->map,
+                    base_model->size,
+                    base_weights->token_embd->abs_offset,
+                    (uint32_t)DS4_N_VOCAB,
+                    mtp_model->map,
+                    mtp_model->size,
+                    mtp->enorm->abs_offset,
+                    mtp->e_proj->abs_offset,
+                    mtp->hnorm->abs_offset,
+                    mtp->h_proj->abs_offset,
+                    ffn_gate_off,
+                    ffn_up_off,
+                    ffn_down_off,
+                    mtp->norm->abs_offset,
+                    base_weights->output->abs_offset,
+                    prev_ptr,
+                    out_ptr,
+                    (uint32_t)DS4_N_EMBD,
+                    shared_dim,
+                    (uint32_t)DS4_N_HC,
+                    logits,
+                    &ane_top))
+            {
+                if (top_id) *top_id = ane_top;
+                if (g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
+                return true;
+            }
+        }
+    }
+#endif
+
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
     uint32_t n_raw = g->mtp_n_raw + 1u;
@@ -51451,7 +51499,7 @@ static bool glm_graph_mtp_step(
         uint32_t           pos,
         uint32_t           min_pos,
         int               *draft_out) {
-    if (!g || !model || !weights || !draft_out) return false;
+    if (!g || !model || !weights) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (pos >= cache_cap || min_pos > pos) {
@@ -51812,6 +51860,83 @@ static bool glm_graph_mtp_step(
                                      g->ffn_out,
                                      g->ffn_sum,
                                      DS4_N_EMBD) != 0;
+    /* Advance-Only mode: caller only wants to advance KV cache, skip output head. */
+    if (!draft_out) {
+        DS4_GLM_MTP_STAGE("end");
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        ds4_gpu_tensor_free(enorm_view);
+        ds4_gpu_tensor_free(hnorm_view);
+        if (!ok) {
+            fprintf(stderr, "ds4: glm mtp step failed at stage '%s' (pos %u)\n",
+                    mtp_stage, pos);
+            return false;
+        }
+        return true;
+    }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ds4_ane_mtp_is_available() && weights->output && weights->output->type == DS4_TENSOR_Q8_0) {
+        DS4_GLM_MTP_STAGE("end");
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        ds4_gpu_tensor_free(enorm_view);
+        ds4_gpu_tensor_free(hnorm_view);
+        if (!ok) {
+            fprintf(stderr, "ds4: glm mtp step failed at stage '%s' (pos %u)\n",
+                    mtp_stage, pos);
+            return false;
+        }
+        const float *hidden_ptr = (const float *)ds4_gpu_tensor_contents(g->next);
+        float *hidden_buf = NULL;
+        if (!hidden_ptr) {
+            if (g->mtp_logits_host && (uint64_t)DS4_N_VOCAB >= 2ull * DS4_N_EMBD) {
+                hidden_buf = g->mtp_logits_host + DS4_N_EMBD;
+            } else {
+                hidden_buf = (float *)malloc((size_t)DS4_N_EMBD * sizeof(float));
+            }
+            if (hidden_buf && ds4_gpu_tensor_read(g->next, 0, hidden_buf, (uint64_t)DS4_N_EMBD * sizeof(float))) {
+                hidden_ptr = hidden_buf;
+            }
+        }
+        int ane_top = -1;
+        bool ane_ok = false;
+        if (hidden_ptr) {
+            float *normed = NULL;
+            bool normed_allocated = false;
+            if (g->mtp_logits_host && (uint64_t)DS4_N_VOCAB >= 2ull * DS4_N_EMBD) {
+                normed = g->mtp_logits_host;
+            } else {
+                normed = (float *)malloc((size_t)DS4_N_EMBD * sizeof(float));
+                normed_allocated = true;
+            }
+            if (normed) {
+                const float *norm_w = (const float *)((const char *)model->map + l->nextn_shared_head_norm->abs_offset);
+                ds4_ane_rms_norm(hidden_ptr, norm_w, normed, (uint32_t)DS4_N_EMBD, DS4_RMS_EPS);
+                if (ds4_ane_vocab_project_argmax(
+                        model->map,
+                        model->size,
+                        weights->output->abs_offset,
+                        (uint32_t)DS4_N_EMBD,
+                        (uint32_t)DS4_N_VOCAB,
+                        normed,
+                        &ane_top)) {
+                    ane_ok = true;
+                }
+                if (normed_allocated) free(normed);
+            }
+        }
+        if (hidden_buf && (!g->mtp_logits_host || hidden_buf != g->mtp_logits_host + DS4_N_EMBD)) {
+            free(hidden_buf);
+        }
+        if (ane_ok) {
+            *draft_out = ane_top;
+            return true;
+        }
+        return false;
+    }
+#endif
+
     /* Shared output head behind the nextn head norm. */
     DS4_GLM_MTP_STAGE("head_norm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
@@ -70301,6 +70426,24 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         return false;
     }
     if (budget > recommended) budget = recommended;
+    /* An explicitly raised iogpu.wired_limit_mb is the user granting the GPU
+     * that much wired memory; the GLM guard already lets it override the
+     * host-fraction heuristic (glm_graph_memory_guard_budget_bytes).  V4.1 must
+     * honour the same rule, otherwise a long-context session is refused on a
+     * host that was explicitly sized for it.  Unset (0) leaves the heuristic
+     * untouched, so the default behaviour is unchanged. */
+#if defined(__APPLE__)
+    {
+        int64_t wired_mb = 0;
+        size_t wired_len = sizeof(wired_mb);
+        if (sysctlbyname("iogpu.wired_limit_mb", &wired_mb, &wired_len, NULL, 0) == 0 && wired_mb > 0) {
+            const uint64_t wired = (uint64_t)wired_mb * 1024ull * 1024ull;
+            const uint64_t margin = 2ull * 1024ull * 1024ull * 1024ull;
+            const uint64_t wired_budget = wired > margin ? wired - margin : wired;
+            if (wired_budget > budget) budget = wired_budget;
+        }
+    }
+#endif
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
@@ -73687,13 +73830,13 @@ static int ds4_session_glm_spec_cycle_impl(
         n_committed = 2;
         /* s->logits already holds row1 (position pos+1) logits. */
         const int n2 = glm_session_logits_argmax(s->logits);
-        int dummy = -1, nd = -1;
+        int nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
         const bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos, NULL) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
