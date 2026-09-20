@@ -85487,6 +85487,15 @@ bool ds4_session_can_rewind(ds4_session *s, int pos) {
     if (pos < 0 || pos >= s->checkpoint.len) return false;
     if (ds4_session_tp_leader(s) && ds4_tp_failed(s->engine->tp.ctx)) return false;
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_GPU
+    /* Keep this in step with ds4_session_rewind()'s qwen4 branch, which reports
+     * the checkpoint as preserved for every in-range position: it either restores
+     * a matching verify snapshot or resets the graph and replays the kept
+     * transcript.  Without this, a caller that asks "can this session roll back
+     * to pos before I destroy it?" gets a false negative for Qwen3.8 and the
+     * live prefix rewind is never attempted. */
+    if (ds4_session_is_qwen4(s)) return true;
+#endif
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph.glm53) return true;
         return s->glm_mtp_rollback_valid &&
